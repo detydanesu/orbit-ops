@@ -416,16 +416,58 @@ app.post('/api/nodes', (req, res) => {
 app.patch('/api/nodes/:id', (req, res) => {
   const row = rowById.get(req.params.id)
   if (!row) return res.status(404).json({ error: 'Resource not found.' })
-  const body = req.body || {}
-  if (Number.isFinite(body.x) && Number.isFinite(body.y)) database.prepare('UPDATE nodes SET x = ?, y = ? WHERE id = ?').run(body.x, body.y, row.id)
-  if (typeof body.name === 'string') {
-    try {
-      const payload = JSON.parse(row.payload)
-      payload.name = requireString(body.name, 'Name')
-      database.prepare('UPDATE nodes SET payload = ? WHERE id = ?').run(JSON.stringify(payload), row.id)
-    } catch (error) { return res.status(400).json({ error: error.message }) }
-  }
-  return res.json({ node: toGraphNode(rowById.get(row.id)) })
+  try {
+    const body = req.body || {}
+    const payload = JSON.parse(row.payload)
+    const type = payload.type
+    let hostChanged = false
+    let sshTargetChanged = false
+    if ('name' in body) payload.name = requireString(body.name, 'Name')
+    if (type === 'vps') {
+      if ('host' in body) {
+        const host = requireString(body.host, 'Host', 253)
+        hostChanged = host !== payload.host
+        payload.host = host
+      }
+      if ('port' in body) {
+        const port = Number(body.port)
+        if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('SSH port must be between 1 and 65535.')
+        hostChanged = hostChanged || port !== Number(payload.port)
+        payload.port = port
+      }
+      if ('username' in body) {
+        const username = requireString(body.username, 'SSH user', 80)
+        sshTargetChanged = username !== payload.username
+        payload.username = username
+      }
+      if ('location' in body) {
+        if (typeof body.location !== 'string') throw new Error('Location must be text.')
+        payload.location = body.location.trim().slice(0, 80)
+      }
+    } else {
+      if ('provider' in body) {
+        if (typeof body.provider !== 'string') throw new Error('Provider must be text.')
+        payload.provider = body.provider.trim().slice(0, 80)
+      }
+      if ('endpoint' in body) {
+        if (typeof body.endpoint !== 'string') throw new Error('Endpoint must be text.')
+        payload.endpoint = body.endpoint.trim().slice(0, 320)
+      }
+      if ((type === 'tunnel' || type === 'external') && !payload.endpoint && !payload.provider) throw new Error('Add an endpoint or provider for this resource.')
+    }
+    if ('notes' in body) {
+      if (typeof body.notes !== 'string') throw new Error('Notes must be text.')
+      payload.notes = body.notes.trim().slice(0, 500)
+    }
+    const x = Number.isFinite(body.x) && Number.isFinite(body.y) ? body.x : row.x
+    const y = Number.isFinite(body.x) && Number.isFinite(body.y) ? body.y : row.y
+    const connectionStatus = hostChanged || sshTargetChanged ? 'untested' : row.connection_status
+    const hostFingerprint = hostChanged ? null : row.host_fingerprint
+    const lastCheckedAt = hostChanged || sshTargetChanged ? null : row.last_checked_at
+    database.prepare('UPDATE nodes SET payload = ?, x = ?, y = ?, host_fingerprint = ?, connection_status = ?, last_checked_at = ? WHERE id = ?')
+      .run(JSON.stringify(payload), x, y, hostFingerprint, connectionStatus, lastCheckedAt, row.id)
+    return res.json({ node: toGraphNode(rowById.get(row.id)) })
+  } catch (error) { return res.status(400).json({ error: error.message || 'Could not update this resource.' }) }
 })
 
 app.delete('/api/nodes/:id', (req, res) => {

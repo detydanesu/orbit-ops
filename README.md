@@ -7,7 +7,8 @@ A self-hosted topology dashboard for VPS hosts, services, and tunnels. It is a s
 - Map VPSes and services on draggable, named graph boards. Record a tunnel or external endpoint as a service with its provider and endpoint.
 - Switch between Map and Desktop views using the header toggle; both share the same saved resources. Your view preference is remembered in this browser.
 - Open desktop resource windows, move or resize them, and minimize/restore them from the dock. On small screens, windows fit the viewport and forms scroll.
-- Add a VPS by importing or pasting an OpenSSH private key (Ed25519, RSA, or ECDSA), including passphrase-protected keys. Invalid keys are rejected before saving. Check the connection, then open an interactive browser terminal over SSH.
+- Upload SSH config and private-key files only in **SSH Files**, then select saved aliases and keys when adding a VPS. Private keys are encrypted on the server; verify the SSH host fingerprint before opening a terminal.
+- Edit saved VPS and service details from their resource windows. Changing a VPS host or port clears its host-key trust for re-verification.
 - Pin the SSH host fingerprint on first use; a changed key must be checked against the provider console before it can be trusted.
 - Store graph data in SQLite and encrypt SSH private keys and key passphrases with AES-256-GCM.
 - Keep Cloudflare and other service entries as topology inventory. They are not continuously monitored and do not call provider APIs.
@@ -66,21 +67,25 @@ This installs the `orbit-ops` system service with a dedicated user, listening on
 
 ## Import an SSH config
 
-In **Add connection > VPS / SSH**, open **Import from SSH config**, choose your local `.ssh/config`, select an alias, and choose **Use this host**. HostName, User, and Port are filled in; IdentityFile is shown as a hint. Select the private-key file separately because browsers cannot automatically read local paths.
+Open **SSH Files** from the header, choose your `.ssh/config` file, review the parsed host aliases, give the file a library name, and save it. The config is parsed in your browser; its original text is not sent to or stored on the server.
 
-After selecting a config, choose **Save N host aliases** to store its parsed host settings for future VPS entries. Saved aliases remain in the SSH setup library until deleted. The importer applies matching Host patterns and first-value precedence, including wildcard defaults. It does not execute commands or follow Include paths. Entries requiring ProxyCommand, ProxyJump, Include, or Match are saved with a warning and disabled for selection until configured manually. URL-shaped HostName values are also retained as flagged entries. Other SSH options are not imported.
+In **Add connection > VPS / SSH**, choose a saved host alias to fill in the host, user, and port. Config uploads and deletion are available only in SSH Files. The importer applies matching Host patterns and first-value precedence, including wildcard defaults. It does not execute commands or follow Include paths. Entries requiring ProxyCommand, ProxyJump, Include, or Match are saved with a warning and disabled for selection until configured manually. URL-shaped HostName values are also retained as flagged entries. Other SSH options are not imported.
 
-Open **SSH Files** from the header in either workspace to browse saved config filenames and host aliases alongside reusable keys and keys attached to a VPS. Add and save a separate context note for each config or key. Config files are parsed in the browser; the server stores their filenames and imported host settings, not the raw config text. Private-key contents remain encrypted on the server and are never displayed or returned to the browser. A VPS-attached key can be removed from its host in the library; Orbit then disables SSH access for that host until a key is added again.
+SSH Files lists saved config names, host aliases, reusable keys, and keys attached to a VPS. Add and save a context note for each config or key. A VPS-attached key can be removed from its host in the library; Orbit then disables SSH access for that host until a key is added again.
 
 ## OpenSSH key-pair login
 
 1. Install your public key in `~/.ssh/authorized_keys` for the VPS account.
-2. Select **Add connection > VPS / SSH** and enter the host, port, and username.
-3. Import the private-key file (`id_ed25519`, `id_rsa`, or PEM), or paste it. Enter its passphrase if encrypted. A `.pub` file alone cannot authenticate.
-4. Choose **Save key for reuse** after importing to add the key to the SSH library, or select **Save this key to the library when adding this VPS**. Later, select a saved key in the VPS form. Saved resource details show the matching public key and login-key fingerprint. Private keys and passphrases are encrypted at rest and never returned by the API.
+2. Open **SSH Files**, upload the OpenSSH private-key file (`id_ed25519`, `id_rsa`, or PEM), and enter its passphrase if it is encrypted. A `.pub` file alone cannot authenticate.
+3. Give the key a library name and save it. The private key and passphrase are encrypted at rest and never returned by the API.
+4. In **Add connection > VPS / SSH**, select a saved host alias if desired, then choose the private key from SSH Files. Direct upload or paste is not available in this form.
 5. Check SSH, verify the separate server host-key fingerprint against a trusted source, then open the terminal.
 
 This uses direct SSH from the Orbit server. Cloudflare Access SSH hostnames require a separately configured transport.
+
+## Editing saved resources
+
+Open a resource's details and choose **Edit** to update its name, VPS target and location, or service provider and endpoint. Map links are preserved. Changing a VPS host or port clears its saved host-key trust, so verify the new fingerprint before opening a terminal.
 
 ## Configuration
 

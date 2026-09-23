@@ -1,0 +1,14 @@
+.ssh-library-uploader{display:grid;gap:9px;padding:13px;border:1px solid #2d414d;border-radius:8px;background:#101a23}
+.ssh-library-uploader>.key-help{margin:0}
+.ssh-library-uploader .field-label{margin-top:3px}
+.ssh-library-uploader>.secondary-button{justify-self:start}
+.ssh-library-uploader .ssh-library-aliases{max-height:230px;overflow:auto}
+.ssh-library-empty{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:12px;border:1px solid #30434f;border-radius:7px;background:#111e27}
+.ssh-library-empty p{margin:0;color:#afbfca;font-size:14px;line-height:1.5}
+.ssh-config-import .ssh-library-empty{margin-top:10px}
+.ssh-config-preview{display:grid;gap:5px;margin-top:11px}
+.ssh-config-preview>p{margin:3px 0}
+.ssh-config-import .key-help{margin-bottom:0}
+.detail-actions{flex-wrap:wrap}
+.detail-actions>span{flex:1;min-width:170px}
+@media(max-width:480px){.ssh-library-empty{align-items:stretch}.ssh-library-empty>.secondary-button{width:100%}.detail-actions>span{flex-basis:100%}}
