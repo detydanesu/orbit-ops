@@ -6,6 +6,7 @@ const express = require('express')
 const Database = require('better-sqlite3')
 const { Client } = require('ssh2')
 const { WebSocket, WebSocketServer } = require('ws')
+const installBoards = require('./boards.cjs')
 
 const production = process.env.NODE_ENV === 'production'
 const adminPassword = process.env.ADMIN_PASSWORD || (production ? '' : 'local-dev-change-me')
@@ -46,6 +47,8 @@ database.exec(`
     value TEXT NOT NULL
   );
 `)
+
+installBoards(database)
 
 const app = express()
 app.disable('x-powered-by')
@@ -89,7 +92,7 @@ function makeSession() {
 
 function readCookie(req, name) {
   const entry = (req.headers.cookie || '').split(';').map((part) => part.trim()).find((part) => part.startsWith(`${name}=`))
-  return entry ? decodeURIComponent(entry.slice(name.length + 1)) : ''
+  try { return entry ? decodeURIComponent(entry.slice(name.length + 1)) : '' } catch { return '' }
 }
 
 function hasValidSession(req) {
@@ -195,16 +198,57 @@ function requireString(value, label, max = 180) {
   return value.trim()
 }
 
-app.get('/api/graph', (_req, res) => {
-  const nodes = database.prepare('SELECT * FROM nodes ORDER BY created_at').all().map(toGraphNode)
-  const edges = database.prepare('SELECT id, source, target FROM edges ORDER BY created_at').all().map((row) => ({ ...row, type: 'smoothstep' }))
+const boardById = database.prepare('SELECT * FROM boards WHERE id = ?')
+const membership = database.prepare('SELECT board_id FROM board_nodes WHERE node_id = ?')
+function listBoards() {
+  return database.prepare(`SELECT b.id, b.name, COUNT(m.node_id) AS resourceCount
+    FROM boards b LEFT JOIN board_nodes m ON m.board_id = b.id
+    GROUP BY b.id ORDER BY b.created_at, b.id`).all()
+}
+
+app.get('/api/graph', (req, res) => {
+  const boardId = typeof req.query.boardId === 'string' ? req.query.boardId : 'default'
+  if (!boardById.get(boardId)) return res.status(404).json({ error: 'Graph board not found.' })
+  const nodes = database.prepare('SELECT n.* FROM nodes n JOIN board_nodes m ON m.node_id = n.id WHERE m.board_id = ? ORDER BY n.created_at').all(boardId).map(toGraphNode)
+  const edges = database.prepare(`SELECT e.id, e.source, e.target FROM edges e
+    JOIN board_nodes s ON s.node_id = e.source JOIN board_nodes t ON t.node_id = e.target
+    WHERE s.board_id = ? AND t.board_id = ? ORDER BY e.created_at`).all(boardId, boardId).map((row) => ({ ...row, type: 'smoothstep' }))
   const setupComplete = database.prepare("SELECT value FROM app_meta WHERE key = 'setup_complete'").get()?.value === '1'
-  res.json({ nodes, edges, demo: nodes.length === 0 && !setupComplete })
+  res.json({ nodes, edges, boards: listBoards(), boardId, demo: boardId === 'default' && nodes.length === 0 && !setupComplete })
+})
+
+app.post('/api/boards', (req, res) => {
+  try {
+    const board = { id: crypto.randomUUID(), name: requireString(req.body?.name, 'Graph name', 80), resourceCount: 0 }
+    database.prepare('INSERT INTO boards (id, name, created_at) VALUES (?, ?, ?)').run(board.id, board.name, new Date().toISOString())
+    return res.status(201).json({ board })
+  } catch (error) { return res.status(400).json({ error: error.message }) }
+})
+
+app.patch('/api/boards/:id', (req, res) => {
+  if (!boardById.get(req.params.id)) return res.status(404).json({ error: 'Graph board not found.' })
+  try {
+    const name = requireString(req.body?.name, 'Graph name', 80)
+    database.prepare('UPDATE boards SET name = ? WHERE id = ?').run(name, req.params.id)
+    return res.json({ board: boardById.get(req.params.id) })
+  } catch (error) { return res.status(400).json({ error: error.message }) }
+})
+
+app.delete('/api/boards/:id', (req, res) => {
+  const id = req.params.id
+  if (id === 'default') return res.status(409).json({ error: 'The original graph cannot be removed.' })
+  if (!boardById.get(id)) return res.status(404).json({ error: 'Graph board not found.' })
+  if (database.prepare('SELECT 1 FROM board_nodes WHERE board_id = ? LIMIT 1').get(id)) return res.status(409).json({ error: 'Remove the resources in this graph before deleting it.' })
+  database.prepare('DELETE FROM boards WHERE id = ?').run(id)
+  return res.status(204).end()
 })
 
 app.post('/api/nodes', (req, res) => {
   try {
     const body = req.body || {}
+    const boardId = typeof body.boardId === 'string' ? body.boardId : 'default'
+    if (!boardById.get(boardId)) return res.status(400).json({ error: 'Choose an existing graph board.' })
+    if (body.parentId && membership.get(body.parentId)?.board_id !== boardId) return res.status(400).json({ error: 'The linked host must be in the same graph board.' })
     const type = ['vps', 'service', 'tunnel', 'external'].includes(body.type) ? body.type : ''
     if (!type) return res.status(400).json({ error: 'Choose a supported resource type.' })
     const payload = { type, name: requireString(body.name, 'Name'), provider: (body.provider || '').trim().slice(0, 80), endpoint: (body.endpoint || '').trim().slice(0, 320), notes: (body.notes || '').trim().slice(0, 500), location: (body.location || '').trim().slice(0, 80) }
@@ -222,12 +266,15 @@ app.post('/api/nodes', (req, res) => {
       if (!payload.endpoint && !payload.provider) return res.status(400).json({ error: 'Add an endpoint or provider for this resource.' })
     }
     const now = new Date().toISOString()
-    database.prepare('INSERT INTO nodes (id, payload, encrypted_key, x, y, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, JSON.stringify(payload), encryptedKey, x, y, now)
-    if (body.parentId && body.parentId !== id) {
-      const parent = rowById.get(body.parentId)
-      if (parent) database.prepare('INSERT OR IGNORE INTO edges (id, source, target, created_at) VALUES (?, ?, ?, ?)').run(crypto.randomUUID(), body.parentId, id, now)
-    }
-    database.prepare("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('setup_complete', '1')").run()
+    database.transaction(() => {
+      database.prepare('INSERT INTO nodes (id, payload, encrypted_key, x, y, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, JSON.stringify(payload), encryptedKey, x, y, now)
+      database.prepare('INSERT INTO board_nodes (node_id, board_id) VALUES (?, ?)').run(id, boardId)
+      if (body.parentId && body.parentId !== id) {
+        const parent = rowById.get(body.parentId)
+        if (parent) database.prepare('INSERT OR IGNORE INTO edges (id, source, target, created_at) VALUES (?, ?, ?, ?)').run(crypto.randomUUID(), body.parentId, id, now)
+      }
+      database.prepare("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('setup_complete', '1')").run()
+    })()
     return res.status(201).json({ node: toGraphNode(rowById.get(id)) })
   } catch (error) {
     return res.status(400).json({ error: error.message || 'Could not add this resource.' })
@@ -257,6 +304,7 @@ app.delete('/api/nodes/:id', (req, res) => {
 app.post('/api/edges', (req, res) => {
   const { source, target } = req.body || {}
   if (!rowById.get(source) || !rowById.get(target) || source === target) return res.status(400).json({ error: 'Choose two different saved resources.' })
+  if (membership.get(source)?.board_id !== membership.get(target)?.board_id) return res.status(400).json({ error: 'Resources must belong to the same graph board.' })
   const id = crypto.randomUUID()
   try {
     database.prepare('INSERT INTO edges (id, source, target, created_at) VALUES (?, ?, ?, ?)').run(id, source, target, new Date().toISOString())
@@ -372,7 +420,11 @@ httpServer.on('upgrade', (req, socket, head) => {
 
 terminalSockets.on('connection', (websocket, _req, row) => {
   const payload = JSON.parse(row.payload)
-  const auth = JSON.parse(unseal(row.encrypted_key))
+  let auth
+  try { auth = JSON.parse(unseal(row.encrypted_key)) } catch {
+    websocket.close(1011, 'Stored SSH credentials could not be read')
+    return
+  }
   const connection = new Client()
   let shell = null
   let closed = false
@@ -396,6 +448,7 @@ terminalSockets.on('connection', (websocket, _req, row) => {
     if (isBinary || raw.length > 16 * 1024) return
     let message
     try { message = JSON.parse(raw.toString('utf8')) } catch { return }
+    if (!message || typeof message !== 'object') return
     if (message.type === 'input' && typeof message.data === 'string' && message.data.length <= 12_000) {
       shell?.write(message.data)
     } else if (message.type === 'resize') {
@@ -435,15 +488,21 @@ terminalSockets.on('connection', (websocket, _req, row) => {
     if (websocket.readyState === WebSocket.OPEN) websocket.close(1011, 'SSH connection failed')
     closeConnection()
   })
-  connection.connect({
-    host: payload.host,
-    port: payload.port,
-    username: payload.username,
-    privateKey: auth.privateKey,
-    passphrase: auth.passphrase || undefined,
-    readyTimeout: 18_000,
-    hostVerifier: (hostKey) => safeEqual(sshFingerprint(hostKey), row.host_fingerprint),
-  })
+  try {
+    connection.connect({
+      host: payload.host,
+      port: payload.port,
+      username: payload.username,
+      privateKey: auth.privateKey,
+      passphrase: auth.passphrase || undefined,
+      readyTimeout: 18_000,
+      hostVerifier: (hostKey) => safeEqual(sshFingerprint(hostKey), row.host_fingerprint),
+    })
+  } catch {
+    send({ type: 'error', message: 'The saved SSH key could not be loaded. Check the key format and passphrase.' })
+    websocket.close(1011, 'Invalid SSH credentials')
+    closeConnection()
+  }
 })
 
 const publicDirectory = path.join(__dirname, '..', 'dist')

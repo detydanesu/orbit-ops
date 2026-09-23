@@ -4,13 +4,23 @@ A self-hosted topology dashboard for VPS hosts, services, and tunnels. It is a s
 
 ## What it does
 
-- Map VPSes, Cloudflare Tunnels, external endpoints, and services on one draggable graph.
+- Map VPSes, Cloudflare Tunnels, external endpoints, and services on draggable, named graph boards.
+- Switch between Map and Desktop views using the header toggle; both share the same saved resources. Your view preference is remembered in this browser.
+- Open desktop resource windows, move or resize them, and minimize/restore them from the dock. On small screens, windows fit the viewport and forms scroll.
 - Add a VPS with SSH key authentication, check the connection, then open an interactive browser terminal over SSH.
 - Pin the SSH host fingerprint on first use; a changed key must be checked against the provider console before it can be trusted.
 - Store graph data in SQLite and encrypt SSH private keys and key passphrases with AES-256-GCM.
 - Keep Cloudflare and other service entries as topology inventory. They are not continuously monitored and do not call provider APIs.
 
 The dashboard host must be able to make outbound SSH connections to each VPS. The browser never opens an SSH socket and never receives a saved private key back from the server. The terminal relays an interactive SSH shell through an authenticated, same-origin WebSocket; it is enabled only after you verify and pin the host fingerprint.
+
+## Workspace views and graph boards
+
+Use **Add graph** to create a separate board for a location or project, and use its tab to switch boards. New resources belong to the selected board; links stay within that board. The pencil button renames the board or removes an empty board. The original board cannot be deleted.
+
+Existing installations are migrated automatically: all previous resources, encrypted keys, positions, and links remain in **Network graph**. Back up the database and encryption key before upgrading.
+
+Use the **Map / Desktop** toggle at any time. Desktop shortcuts open resource controls, including the browser SSH terminal for verified hosts. The dock restores minimized windows and brings open windows to the front.
 
 ## Run locally
 
@@ -44,6 +54,16 @@ cd /opt/orbit-ops && docker compose logs -f dashboard
 
 The SQLite database lives in the `orbit-data` Docker volume. Back up that volume and the private `.env` file together: losing `DATA_ENCRYPTION_KEY` makes saved SSH keys unrecoverable. Never commit `.env` or copy it into a public repository.
 
+### Native Linux service (without Docker)
+
+On a systemd host with Node.js 24+, npm, Git, OpenSSL, curl, and the native build tools installed:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/detydanesu/orbit-ops/main/deploy-systemd.sh | sudo bash -s -- detydanesu/orbit-ops
+```
+
+This installs the `orbit-ops` system service with a dedicated user, listening on `127.0.0.1:8787`. It preserves generated credentials across updates in `/etc/orbit-ops/environment` (root only). Read `ADMIN_PASSWORD` there to sign in. The database lives in `/var/lib/orbit-ops`; back it up together with the environment file. Use an HTTPS reverse proxy or Cloudflare Tunnel for browser access. Rerun the same command to update.
+
 ## Configuration
 
 `deploy.sh` creates `.env` on first deployment. For manual setup, copy `.env.example` to `.env` and set unique random values for `ADMIN_PASSWORD`, `SESSION_SECRET`, and `DATA_ENCRYPTION_KEY` (64 hexadecimal characters for the encryption key). Keep `COOKIE_SECURE=true` when access is through HTTPS.
@@ -60,3 +80,13 @@ docker compose up -d --build
 - Deleting a host removes its encrypted key and graph links from the database.
 - Service and tunnel nodes are user-maintained inventory, not live status checks.
 - The published host port binds to loopback. Expose it through an HTTPS reverse proxy or Cloudflare Tunnel, not a public plain-HTTP port.
+
+## Development checks
+
+```sh
+npm run build
+npm run lint
+node --test tests/*.test.cjs
+```
+
+Board tests run against isolated temporary databases and cover migration, authentication, board separation, cross-board link rejection, and safe deletion.

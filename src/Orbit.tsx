@@ -7,13 +7,16 @@ import {
 import {
   Activity, ArrowDownRight, ArrowUpRight, Box, Cable, Check, Cloud, Command, Database,
   Globe2, KeyRound, Layers3, LoaderCircle, LogOut, Plus, Server, ShieldCheck,
-  ExternalLink, Trash2, Waypoints, X,
+  ExternalLink, Monitor, Pencil, Trash2, Waypoints, X,
 } from 'lucide-react'
 import '@xyflow/react/dist/style.css'
 import '@xterm/xterm/css/xterm.css'
 import './Dashboard.css'
 import './Orbit.css'
 import './Canvas.css'
+import './Workspace.css'
+import Desktop from './Desktop'
+import WindowFrame from './WindowFrame'
 
 type ResourceType = 'vps' | 'service' | 'tunnel' | 'external'
 type ResourceData = {
@@ -25,7 +28,8 @@ type ResourceData = {
   hasPrivateKey?: boolean; hostFingerprint?: string; connectionStatus?: string; lastCheckedAt?: string
 }
 type ResourceNode = Node<ResourceData>
-type GraphResponse = { nodes: ResourceNode[]; edges: Edge[]; demo: boolean }
+type GraphBoard = { id: string; name: string; resourceCount: number }
+type GraphResponse = { nodes: ResourceNode[]; edges: Edge[]; demo: boolean; boards: GraphBoard[]; boardId: string }
 type LoginResponse = { authenticated: boolean }
 type SshResult = { ok: boolean; error?: string; needsTrust?: boolean; fingerprint?: string; replacesExisting?: boolean; previousFingerprint?: string; checkedAt?: string }
 type Draft = { type: ResourceType; name: string; host: string; port: string; username: string; privateKey: string; passphrase: string; provider: string; endpoint: string; location: string; notes: string; parentId: string }
@@ -63,7 +67,7 @@ function endpointUrl(value: string) {
   } catch { return null }
 }
 
-function TerminalWindow({ nodeId, name, onClose }: { nodeId: string; name: string; onClose: () => void }) {
+function TerminalWindow({ nodeId, name, onClose, desktop, minimized, onMinimize, focusToken }: { nodeId: string; name: string; onClose: () => void; desktop: boolean; minimized: boolean; onMinimize: () => void; focusToken: number }) {
   const hostRef = useRef<HTMLDivElement>(null)
   const [status, setStatus] = useState('Connecting')
 
@@ -119,14 +123,14 @@ function TerminalWindow({ nodeId, name, onClose }: { nodeId: string; name: strin
         if (socket.readyState < WebSocket.CLOSING) socket.close()
         terminal.dispose()
       }
-    })()
+    })().catch(() => { if (!disposed) setStatus('Terminal could not load. Refresh and try again.') })
     return () => {
       disposed = true
       cleanup()
     }
   }, [nodeId])
 
-  return <div className="modal-backdrop terminal-backdrop"><section className="terminal-modal" role="dialog" aria-modal="true" aria-label={`SSH terminal for ${name}`}><header className="terminal-heading"><div><span className="modal-kicker">SSH SESSION</span><h2>{name}</h2><p><i className={status === 'Connected' ? 'terminal-live' : ''} />{status}</p></div><button className="modal-close" onClick={onClose} aria-label="Close terminal"><X size={17} /></button></header><div ref={hostRef} className="terminal-screen" /><footer className="terminal-footer"><span>SSH · XTERM-256COLOR</span><span>SESSION ENDS WHEN THIS WINDOW CLOSES</span></footer></section></div>
+  return <WindowFrame desktop={desktop} title={`Terminal · ${name}`} onClose={onClose} wide focusToken={focusToken} minimized={minimized} onMinimize={onMinimize}><section className="terminal-modal"><header className="terminal-heading"><div><span className="modal-kicker">SSH SESSION</span><h2>{name}</h2><p><i className={status === 'Connected' ? 'terminal-live' : ''} />{status}</p></div><button className="modal-close" onClick={onClose} aria-label="Close terminal"><X size={17} /></button></header><div ref={hostRef} className="terminal-screen" /><footer className="terminal-footer"><span>SSH · XTERM-256COLOR</span><span>SESSION ENDS WHEN THIS WINDOW CLOSES</span></footer></section></WindowFrame>
 }
 
 function ResourceNodeView({ data, selected }: NodeProps<ResourceNode>) {
@@ -163,6 +167,18 @@ function SignIn({ onSuccess }: { onSuccess: () => void }) {
 }
 
 function App() {
+  const [view, setView] = useState<'map' | 'desktop'>(() => { try { return localStorage.getItem('orbit-view') === 'desktop' ? 'desktop' : 'map' } catch { return 'map' } })
+  const desktop = view === 'desktop'
+  const [boards, setBoards] = useState<GraphBoard[]>([])
+  const [boardId, setBoardId] = useState('default')
+  const boardRef = useRef('default')
+  const graphRequest = useRef(0)
+  const [boardLoading, setBoardLoading] = useState(false)
+  const [boardDialog, setBoardDialog] = useState<'add' | 'rename' | null>(null)
+  const [boardName, setBoardName] = useState('')
+  const [boardBusy, setBoardBusy] = useState(false)
+  const [windowFocus, setWindowFocus] = useState<Record<string, number>>({})
+  const [minimizedWindows, setMinimizedWindows] = useState<string[]>([])
   const [nodes, setNodes, onNodesChange] = useNodesState<ResourceNode>(sampleNodes)
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(sampleEdges)
   const [authenticated, setAuthenticated] = useState(false)
@@ -182,19 +198,31 @@ function App() {
   const [viewport, setViewport] = useState({ x: 0, y: 0, zoom: 1 })
   const realNodes = useMemo(() => nodes.filter((node) => !node.id.startsWith('sample-')), [nodes])
   const selected = nodes.find((node) => node.id === selectedId) || null
+  const activeBoard = boards.find((board) => board.id === boardId)
+  const restoreWindow = (id: string) => { setMinimizedWindows((current) => current.filter((item) => item !== id)); setWindowFocus((current) => ({ ...current, [id]: (current[id] || 0) + 1 })) }
+  const minimizeWindow = (id: string) => setMinimizedWindows((current) => [...new Set([...current, id])])
+  const changeView = (next: 'map' | 'desktop') => { setView(next); setMinimizedWindows([]); try { localStorage.setItem('orbit-view', next) } catch { /* preferences are optional */ } }
   const closeTerminal = useCallback(() => setTerminalNode(null), [])
   const vpsNodes = nodes.filter((node) => node.data.resourceType === 'vps' && !node.id.startsWith('sample-'))
   const hostCount = nodes.filter((node) => node.data.resourceType === 'vps').length
   const tunnelCount = nodes.filter((node) => node.data.resourceType === 'tunnel').length
   const serviceCount = nodes.filter((node) => node.data.resourceType === 'service' || node.data.resourceType === 'external').length
 
-  const loadGraph = useCallback(async () => {
-    const graph = await request<GraphResponse>('/graph')
+  const loadGraph = useCallback(async (nextId = boardRef.current) => {
+    const version = ++graphRequest.current
+    setBoardLoading(true)
+    try {
+    const graph = await request<GraphResponse>(`/graph?boardId=${encodeURIComponent(nextId)}`)
+    if (version !== graphRequest.current) return
+    boardRef.current = graph.boardId
+    setBoardId(graph.boardId)
+    setBoards(graph.boards)
     setIsDemo(graph.demo)
-    setNodes(graph.nodes.length ? graph.nodes : graph.demo ? sampleNodes : [])
+    setNodes(graph.nodes.length ? graph.nodes.map((node) => ({ ...node, deletable: false })) : graph.demo ? sampleNodes : [])
     setEdges(graph.edges.length ? graph.edges : graph.demo ? sampleEdges : [])
     if (graph.nodes.length) setSelectedId((previous) => graph.nodes.some((node) => node.id === previous) ? previous : graph.nodes[0].id)
-    else if (!graph.demo) setSelectedId(null)
+    else setSelectedId(graph.demo ? sampleNodes[0].id : null)
+    } finally { if (version === graphRequest.current) setBoardLoading(false) }
   }, [setEdges, setNodes])
 
   useEffect(() => {
@@ -208,12 +236,36 @@ function App() {
     setAuthenticated(true)
     try { await loadGraph() } catch (error) { notify(error instanceof Error ? error.message : 'Could not load the map.', 'error') }
   }
-  const openAdd = () => { setDraft(blankDraft); setMessage(null); setAddOpen(true) }
+  const openDetails = (id = selectedId) => { if (boardLoading || !id) return; setSelectedId(id); setVerification(null); setDeleteConfirm(false); restoreWindow('details'); setDetailsOpen(true) }
+  const openAdd = () => { if (boardLoading) return; setDraft(blankDraft); setMessage(null); restoreWindow('add'); setAddOpen(true) }
+  const openBoardDialog = (mode: 'add' | 'rename') => { setBoardName(mode === 'rename' ? activeBoard?.name || '' : ''); restoreWindow('board'); setBoardDialog(mode) }
+  const switchBoard = async (id: string) => {
+    if (id === boardId || boardLoading || saveBusy || testBusy || trustBusy || boardBusy) return
+    setDetailsOpen(false); setAddOpen(false); setBoardDialog(null); setVerification(null); setDeleteConfirm(false)
+    try { await loadGraph(id) } catch (error) { notify(error instanceof Error ? error.message : 'Could not open this graph.', 'error') }
+  }
+  const saveBoard = async (event: FormEvent) => {
+    event.preventDefault(); setBoardBusy(true)
+    try {
+      if (boardDialog === 'add') {
+        const result = await request<{ board: GraphBoard }>('/boards', { method: 'POST', body: JSON.stringify({ name: boardName }) })
+        setDetailsOpen(false); setAddOpen(false); setVerification(null); await loadGraph(result.board.id)
+      } else { await request(`/boards/${boardId}`, { method: 'PATCH', body: JSON.stringify({ name: boardName }) }); await loadGraph() }
+      setBoardDialog(null); notify(boardDialog === 'add' ? 'Graph board added.' : 'Graph renamed.')
+    } catch (error) { notify(error instanceof Error ? error.message : 'Could not save this graph.', 'error') }
+    finally { setBoardBusy(false) }
+  }
+  const removeBoard = async () => {
+    setBoardBusy(true)
+    try { await request(`/boards/${boardId}`, { method: 'DELETE' }); setBoardDialog(null); await loadGraph('default'); notify('Empty graph removed.') }
+    catch (error) { notify(error instanceof Error ? error.message : 'Could not remove this graph.', 'error') }
+    finally { setBoardBusy(false) }
+  }
   const addNode = async (event: FormEvent) => {
     event.preventDefault(); setSaveBusy(true); setMessage(null)
     const x = 90 + (realNodes.length % 3) * 278
     const y = 110 + (Math.floor(realNodes.length / 3) % 2) * 205
-    const body = { ...draft, port: Number(draft.port || 22), x, y, parentId: draft.parentId || undefined }
+    const body = { ...draft, boardId, port: Number(draft.port || 22), x, y, parentId: draft.parentId || undefined }
     try {
       await request('/nodes', { method: 'POST', body: JSON.stringify(body) })
       setDraft(blankDraft); setAddOpen(false); setVerification(null); await loadGraph(); notify('Resource added to the map.')
@@ -262,42 +314,56 @@ function App() {
   }
   const signOut = async () => {
     try { await request('/session', { method: 'DELETE' }) } catch { /* the next request will require a fresh sign-in */ }
+    ++graphRequest.current; boardRef.current = 'default'; setBoardId('default'); setBoards([]); setDetailsOpen(false); setAddOpen(false); setTerminalNode(null); setBoardDialog(null); setMinimizedWindows([])
     setAuthenticated(false); setNodes(sampleNodes); setEdges(sampleEdges); setIsDemo(true); setSelectedId(sampleNodes[0].id)
   }
 
   if (!sessionLoaded) return <main className="signin-screen"><div className="signin-loading"><LoaderCircle className="spin" size={23} /><span>Loading workspace…</span></div></main>
   if (!authenticated) return <SignIn onSuccess={handleSignedIn} />
 
-  return <ReactFlowProvider><div className="app-frame">
-    <aside className="rail"><div className="brand-mark"><Waypoints size={20} strokeWidth={1.8} /></div><div className="rail-divider" /><button className="rail-action active" aria-label="System map"><Waypoints size={18} /></button><button className="rail-action" aria-label="Inventory" onClick={openAdd}><Layers3 size={18} /></button><button className="rail-action" aria-label="Activity" onClick={() => selected && setDetailsOpen(true)}><Activity size={18} /></button><div className="rail-spacer" /><button className="rail-action" aria-label="Sign out" onClick={() => void signOut()}><LogOut size={17} /></button><div className="rail-avatar">O</div></aside>
+  const boardNavigation = <div className="board-navigation" aria-label="Graph boards">
+    <div className="board-tabs" role="group" aria-label="Choose graph board">{boards.map((board) => <button key={board.id} className={board.id === boardId ? 'board-tab selected' : 'board-tab'} aria-pressed={board.id === boardId} disabled={boardLoading || saveBusy || testBusy || trustBusy || boardBusy} onClick={() => void switchBoard(board.id)} title={board.name}><Layers3 size={15} /><span>{board.name}</span><small>{board.resourceCount}</small></button>)}</div>
+    <div className="board-actions"><button className="board-add" onClick={() => openBoardDialog('add')} disabled={boardLoading || saveBusy || boardBusy}><Plus size={16} /><span>Add graph</span></button><button className="board-edit" aria-label="Rename current graph" title="Rename graph" onClick={() => openBoardDialog('rename')} disabled={boardLoading || !activeBoard}><Pencil size={15} /></button></div>
+  </div>
+  const openWindows = [
+    ...(addOpen ? [{ id: 'add', title: 'Add connection', minimized: minimizedWindows.includes('add') }] : []),
+    ...(detailsOpen && selected ? [{ id: 'details', title: selected.data.name, minimized: minimizedWindows.includes('details') }] : []),
+    ...(terminalNode ? [{ id: 'terminal', title: 'Terminal · ' + terminalNode.data.name, minimized: minimizedWindows.includes('terminal') }] : []),
+    ...(boardDialog ? [{ id: 'board', title: 'Graph board', minimized: minimizedWindows.includes('board') }] : []),
+  ]
+  return <ReactFlowProvider><div className={desktop ? 'app-frame desktop-mode' : 'app-frame'}>
+    <aside className="rail"><div className="brand-mark"><Waypoints size={20} strokeWidth={1.8} /></div><div className="rail-divider" /><button className="rail-action active" aria-label="System map" onClick={() => changeView('map')}><Waypoints size={18} /></button><button className="rail-action" aria-label="Inventory" onClick={openAdd}><Layers3 size={18} /></button><button className="rail-action" aria-label="Activity" onClick={() => openDetails()}><Activity size={18} /></button><div className="rail-spacer" /><button className="rail-action" aria-label="Sign out" onClick={() => void signOut()}><LogOut size={17} /></button><div className="rail-avatar">O</div></aside>
     <main className="main-column">
-      <header className="topbar"><div className="crumb"><span>ORBIT</span><span className="crumb-slash">/</span><strong>OPERATIONS</strong></div><div className="topbar-right"><span className="secure-label"><ShieldCheck size={14} /> SELF-HOSTED</span><span className="topbar-separator" /><button className="help-button" onClick={() => selected && setDetailsOpen(true)}><Command size={14} /> RESOURCE DETAILS</button></div></header>
-      <section className="workspace">
+      <header className="topbar"><div className="crumb"><span>ORBIT</span><span className="crumb-slash">/</span><strong>OPERATIONS</strong></div><div className="topbar-right"><div className="view-switch" role="group" aria-label="Workspace view"><button aria-pressed={!desktop} onClick={() => changeView('map')}><Waypoints size={16} /><span>Map</span></button><button aria-pressed={desktop} onClick={() => changeView('desktop')}><Monitor size={16} /><span>Desktop</span></button></div><span className="secure-label"><ShieldCheck size={14} /> SELF-HOSTED</span><span className="topbar-separator" /><button className="help-button" onClick={() => openDetails()}><Command size={14} /> RESOURCE DETAILS</button><button className="topbar-logout" aria-label="Sign out of Orbit" onClick={() => void signOut()}><LogOut size={17} /></button></div></header>
+      {desktop ? <><div className="desktop-board-bar">{boardNavigation}</div><Desktop name={activeBoard?.name || 'Network graph'} nodes={nodes} demo={isDemo} onOpen={openDetails} onAdd={openAdd} onMap={() => changeView('map')} onAddBoard={() => openBoardDialog('add')} windows={openWindows} onRestore={restoreWindow} /></> : <section className="workspace">
         <div className="workspace-heading"><div><div className="eyebrow"><span className="eyebrow-line" />INFRASTRUCTURE / TOPOLOGY</div><h1>System map</h1><p className="subtitle">See how your hosts, services, and tunnels fit together.</p></div><button className="primary-button" onClick={openAdd}><Plus size={17} /> Add connection</button></div>
         <div className="metric-strip"><div className="metric"><span className="metric-icon cyan"><Server size={16} /></span><span><small>HOSTS</small><strong>{String(hostCount).padStart(2, '0')} <em>{isDemo ? 'EXAMPLE' : 'SAVED'}</em></strong></span></div><div className="metric-divider" /><div className="metric"><span className="metric-icon orange"><Cloud size={16} /></span><span><small>TUNNELS</small><strong>{String(tunnelCount).padStart(2, '0')} <em>{isDemo ? 'EXAMPLE' : 'TRACKED'}</em></strong></span></div><div className="metric-divider" /><div className="metric"><span className="metric-icon violet"><Box size={16} /></span><span><small>SERVICES</small><strong>{String(serviceCount).padStart(2, '0')} <em>{isDemo ? 'EXAMPLE' : 'TRACKED'}</em></strong></span></div><div className={`metric-note ${isDemo ? '' : 'note-saved'}`}><i /> {isDemo ? 'DEMO TOPOLOGY · NOT CONNECTED' : 'SAVED MAP · CONNECTIONS ARE MANUAL'}</div></div>
-        <section className="map-panel" aria-label="Infrastructure topology graph"><div className="map-toolbar"><div className="map-label"><span className="map-label-icon"><Cable size={15} /></span><strong>NETWORK GRAPH</strong><span className="map-divider">/</span><span className="map-count">{String(nodes.length).padStart(2, '0')} RESOURCES</span></div><div className="map-tools"><span className="layout-label">DRAG NODES TO ARRANGE</span><button className="toolbar-button" onClick={openAdd}><Plus size={14} /><span>NEW NODE</span></button></div></div>
-          <div className="flow-wrap"><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={(connection) => void handleConnect(connection)} onEdgesDelete={handleEdgesDelete} onNodeClick={(_: MouseEvent, node: ResourceNode) => setSelectedId(node.id)} onNodeDragStop={savePosition} onMove={(_, nextViewport) => setViewport(nextViewport)} fitView fitViewOptions={{ padding: 0.08, maxZoom: 1 }} minZoom={0.55} maxZoom={1.55} nodesConnectable edgesReconnectable={false} deleteKeyCode={isDemo ? null : ['Backspace', 'Delete']} proOptions={{ hideAttribution: false }}><Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#283442" /><Controls showInteractive={false} position="bottom-left" /><MiniMap pannable zoomable nodeColor={(node) => `var(--${(node.data as ResourceData).tint})`} maskColor="rgba(11, 16, 23, .76)" position="bottom-right" /></ReactFlow><div className="map-coordinates"><span>TOPOLOGY CANVAS</span><span>X {Math.round(viewport.x)} · Y {Math.round(viewport.y)} · {Math.round(viewport.zoom * 100)}%</span></div>{isDemo && <div className="sample-stamp">SAMPLE<br />GRAPH</div>}{nodes.length === 0 && <div className="empty-graph"><span className="empty-graph-icon"><Waypoints size={22} /></span><strong>Your map is clear.</strong><span>Add a VPS, service, or tunnel to start building it.</span><button className="primary-button" onClick={openAdd}><Plus size={15} /> Add first resource</button></div>}</div>
+        {boardNavigation}
+        <section className="map-panel" aria-label="Infrastructure topology graph"><div className="map-toolbar"><div className="map-label"><span className="map-label-icon"><Cable size={15} /></span><strong title={activeBoard?.name}>{activeBoard?.name || 'Network graph'}</strong><span className="map-divider">/</span><span className="map-count">{String(nodes.length).padStart(2, '0')} RESOURCES</span></div><div className="map-tools"><span className="layout-label">DRAG NODES TO ARRANGE</span><button className="toolbar-button" onClick={openAdd}><Plus size={14} /><span>NEW NODE</span></button></div></div>
+          <div className="flow-wrap"><ReactFlow key={boardId} nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={(connection) => void handleConnect(connection)} onEdgesDelete={handleEdgesDelete} onNodeClick={(_: MouseEvent, node: ResourceNode) => { setSelectedId(node.id); setVerification(null) }} onNodeDoubleClick={(_: MouseEvent, node: ResourceNode) => openDetails(node.id)} onNodeDragStop={savePosition} onMove={(_, nextViewport) => setViewport(nextViewport)} fitView fitViewOptions={{ padding: 0.08, maxZoom: 1 }} minZoom={0.15} maxZoom={1.55} nodesConnectable edgesReconnectable={false} deleteKeyCode={isDemo ? null : ['Backspace', 'Delete']} proOptions={{ hideAttribution: false }}><Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#283442" /><Controls showInteractive={false} position="bottom-left" /><MiniMap pannable zoomable nodeColor={(node) => `var(--${(node.data as ResourceData).tint})`} maskColor="rgba(11, 16, 23, .76)" position="bottom-right" /></ReactFlow><div className="map-coordinates"><span>TOPOLOGY CANVAS</span><span>X {Math.round(viewport.x)} · Y {Math.round(viewport.y)} · {Math.round(viewport.zoom * 100)}%</span></div>{isDemo && <div className="sample-stamp">SAMPLE<br />GRAPH</div>}{nodes.length === 0 && <div className="empty-graph"><span className="empty-graph-icon"><Waypoints size={22} /></span><strong>Your map is clear.</strong><span>Add a VPS, service, or tunnel to start building it.</span><button className="primary-button" onClick={openAdd}><Plus size={15} /> Add first resource</button></div>}</div>
           <footer className="map-footer"><span><i className="legend-dot cyan-dot" />VPS HOST</span><span><i className="legend-dot orange-dot" />TUNNEL</span><span><i className="legend-dot violet-dot" />SERVICE</span><span className="footer-hint">CONNECT NODES BY DRAGGING BETWEEN PORTS <span>·</span> SCROLL TO ZOOM</span></footer></section>
-        <div className="bottom-row"><section className="selection-card"><div className={`selection-glyph tint-${selected?.data.tint || 'cyan'}`}>{selected?.data.icon === 'cloud' ? <Cloud size={18} /> : selected?.data.icon === 'database' ? <Database size={18} /> : selected?.data.icon === 'globe' ? <Globe2 size={18} /> : <Server size={18} />}</div><div className="selection-copy"><small>SELECTED RESOURCE <span>·</span> {selected?.data.kind || 'NONE SELECTED'}</small><strong>{selected?.data.name || 'Select a node on the map'}</strong><span>{selected?.data.meta || 'Add a host or service to begin.'}</span></div>{selected && <span className={`selection-status ${selected.data.status === 'CHECK OK' ? 'selection-good' : ''}`}><i /> {selected.data.status}</span>}<button className="icon-button" aria-label="Open resource details" disabled={!selected} onClick={() => setDetailsOpen(true)}><ArrowUpRight size={17} /></button></section><section className="connection-card"><div><span className="connection-icon"><Activity size={16} /></span><span className="connection-copy"><small>SSH CONNECTION CHECKS</small><strong>{nodes.filter((node) => node.data.resourceType === 'vps' && node.data.connectionStatus === 'connected').length} successful · manual checks only</strong></span></div><ArrowDownRight className="muted-arrow" size={17} /></section></div>
+        <div className="bottom-row"><section className="selection-card"><div className={`selection-glyph tint-${selected?.data.tint || 'cyan'}`}>{selected?.data.icon === 'cloud' ? <Cloud size={18} /> : selected?.data.icon === 'database' ? <Database size={18} /> : selected?.data.icon === 'globe' ? <Globe2 size={18} /> : <Server size={18} />}</div><div className="selection-copy"><small>SELECTED RESOURCE <span>·</span> {selected?.data.kind || 'NONE SELECTED'}</small><strong>{selected?.data.name || 'Select a node on the map'}</strong><span>{selected?.data.meta || 'Add a host or service to begin.'}</span></div>{selected && <span className={`selection-status ${selected.data.status === 'CHECK OK' ? 'selection-good' : ''}`}><i /> {selected.data.status}</span>}<button className="icon-button" aria-label="Open resource details" disabled={!selected} onClick={() => openDetails()}><ArrowUpRight size={17} /></button></section><section className="connection-card"><div><span className="connection-icon"><Activity size={16} /></span><span className="connection-copy"><small>SSH CONNECTION CHECKS</small><strong>{nodes.filter((node) => node.data.resourceType === 'vps' && node.data.connectionStatus === 'connected').length} successful · manual checks only</strong></span></div><ArrowDownRight className="muted-arrow" size={17} /></section></div>
         <div className="workspace-footnote"><span>ORBIT OPS <b>0.1.0</b></span><span>{isDemo ? 'EXAMPLE MAP ONLY · YOUR INVENTORY STARTS WHEN YOU ADD A RESOURCE.' : 'SERVICE AND TUNNEL NODES ARE INVENTORY ONLY; NO CONTINUOUS PROBES RUN.'}</span><span>ENCRYPTED SSH <i /> SELF-HOSTED</span></div>
-      </section>
+      </section>}
+      {boardLoading && <div className="board-loading" role="status"><LoaderCircle className="spin" size={18} />Loading graph…</div>}
     </main>
 
-    {addOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !saveBusy) setAddOpen(false) }}><form className="resource-modal" onSubmit={(event) => void addNode(event)}><header className="modal-heading"><div><span className="modal-kicker">MAP INVENTORY</span><h2>Add a resource</h2><p>Register an SSH host or track a service that lives anywhere.</p></div><button type="button" className="modal-close" onClick={() => setAddOpen(false)} aria-label="Close"><X size={17} /></button></header>
+    {addOpen && <WindowFrame desktop={desktop} title="Add connection" onClose={() => { if (!saveBusy) setAddOpen(false) }} focusToken={windowFocus.add || 0} minimized={minimizedWindows.includes('add')} onMinimize={() => minimizeWindow('add')}><form className="resource-modal" onSubmit={(event) => void addNode(event)}><header className="modal-heading"><div><span className="modal-kicker">MAP INVENTORY</span><h2>Add a resource</h2><p>Add to {activeBoard?.name || 'this graph'}.</p></div><button type="button" className="modal-close" onClick={() => setAddOpen(false)} aria-label="Close"><X size={17} /></button></header>
       <div className="type-switch" role="group" aria-label="Resource type"><button type="button" className={draft.type === 'vps' ? 'selected' : ''} onClick={() => setDraft({ ...blankDraft, type: 'vps' })}><Server size={15} /> VPS / SSH</button><button type="button" className={draft.type !== 'vps' ? 'selected' : ''} onClick={() => setDraft({ ...draft, type: draft.type === 'vps' ? 'service' : draft.type })}><Layers3 size={15} /> SERVICE / TUNNEL</button></div>
       {draft.type !== 'vps' && <label className="field-label" htmlFor="resource-type">Resource type<select id="resource-type" className="text-input" value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value as ResourceType, provider: event.target.value === 'tunnel' ? 'Cloudflare' : '' })}><option value="service">Service</option><option value="tunnel">Cloudflare Tunnel</option><option value="external">External service</option></select></label>}
       <label className="field-label" htmlFor="resource-name">Name<input id="resource-name" className="text-input" placeholder={draft.type === 'vps' ? 'e.g. Singapore edge' : draft.type === 'tunnel' ? 'e.g. Public ingress' : 'e.g. PostgreSQL'} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} maxLength={180} required autoFocus /></label>
       {draft.type === 'vps' ? <><div className="field-row"><label className="field-label" htmlFor="ssh-host">Host / IP<input id="ssh-host" className="text-input" placeholder="203.0.113.10" value={draft.host} onChange={(event) => setDraft({ ...draft, host: event.target.value })} autoComplete="off" required /></label><label className="field-label port-field" htmlFor="ssh-port">Port<input id="ssh-port" className="text-input" inputMode="numeric" value={draft.port} onChange={(event) => setDraft({ ...draft, port: event.target.value })} required /></label></div><div className="field-row"><label className="field-label" htmlFor="ssh-user">SSH username<input id="ssh-user" className="text-input" placeholder="root" value={draft.username} onChange={(event) => setDraft({ ...draft, username: event.target.value })} autoComplete="off" required /></label><label className="field-label" htmlFor="ssh-location">Location <span className="optional-label">OPTIONAL</span><input id="ssh-location" className="text-input" placeholder="Singapore" value={draft.location} onChange={(event) => setDraft({ ...draft, location: event.target.value })} /></label></div>{import.meta.env.DEV && <div className="dev-warning">Local development mode uses a fixed encryption key. Do not save real SSH keys here.</div>}<label className="field-label" htmlFor="ssh-key">Private key<textarea id="ssh-key" className="text-input key-input" placeholder="Paste the OpenSSH private key for this host" value={draft.privateKey} onChange={(event) => setDraft({ ...draft, privateKey: event.target.value })} spellCheck={false} autoComplete="off" required /></label><label className="field-label" htmlFor="ssh-passphrase">Key passphrase <span className="optional-label">OPTIONAL</span><input id="ssh-passphrase" className="text-input" type="password" autoComplete="new-password" value={draft.passphrase} onChange={(event) => setDraft({ ...draft, passphrase: event.target.value })} /></label><div className="security-note"><ShieldCheck size={15} /><span>The private key and passphrase are encrypted before they are stored on this server. They are never sent to the browser again.</span></div></> : <><div className="field-row"><label className="field-label" htmlFor="resource-provider">Provider<input id="resource-provider" className="text-input" placeholder={draft.type === 'tunnel' ? 'Cloudflare' : 'Docker, AWS…'} value={draft.provider} onChange={(event) => setDraft({ ...draft, provider: event.target.value })} /></label><label className="field-label" htmlFor="resource-endpoint">Endpoint<input id="resource-endpoint" className="text-input" placeholder="https://… or localhost:port" value={draft.endpoint} onChange={(event) => setDraft({ ...draft, endpoint: event.target.value })} /></label></div>{vpsNodes.length > 0 && <label className="field-label" htmlFor="resource-parent">Connected to <span className="optional-label">OPTIONAL</span><select id="resource-parent" className="text-input" value={draft.parentId} onChange={(event) => setDraft({ ...draft, parentId: event.target.value })}><option value="">No host link yet</option>{vpsNodes.map((node) => <option key={node.id} value={node.id}>{node.data.name}</option>)}</select></label>}<label className="field-label" htmlFor="resource-notes">Notes <span className="optional-label">OPTIONAL</span><textarea id="resource-notes" className="text-input notes-input" placeholder="Where it runs, which service it routes to, or other context." value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></label><div className="security-note"><Cloud size={15} /><span>Tunnels and services are saved as topology records. This does not query their provider APIs or monitor health.</span></div></>}
       <footer className="form-footer"><span>ADDED TO YOUR LOCAL MAP</span><button type="button" className="secondary-button" onClick={() => setAddOpen(false)} disabled={saveBusy}>Cancel</button><button type="submit" className="primary-button" disabled={saveBusy}>{saveBusy ? <LoaderCircle size={16} className="spin" /> : <Plus size={15} />} Add resource</button></footer>
-    </form></div>}
+    </form></WindowFrame>}
 
-    {detailsOpen && selected && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) { setDetailsOpen(false); setDeleteConfirm(false) } }}><section className="details-modal"><header className="modal-heading"><div><span className="modal-kicker">{selected.data.kind}</span><h2>{selected.data.name}</h2><p>{selected.data.meta}</p></div><button className="modal-close" onClick={() => { setDetailsOpen(false); setDeleteConfirm(false) }} aria-label="Close"><X size={17} /></button></header>
+    {detailsOpen && selected && <WindowFrame desktop={desktop} title={selected.data.name} onClose={() => { setDetailsOpen(false); setDeleteConfirm(false) }} focusToken={windowFocus.details || 0} minimized={minimizedWindows.includes('details')} onMinimize={() => minimizeWindow('details')}><section className="details-modal"><header className="modal-heading"><div><span className="modal-kicker">{selected.data.kind}</span><h2>{selected.data.name}</h2><p>{selected.data.meta}</p></div><button className="modal-close" onClick={() => { setDetailsOpen(false); setDeleteConfirm(false) }} aria-label="Close"><X size={17} /></button></header>
       <div className="detail-grid"><span>TYPE</span><strong>{selected.data.resourceType.toUpperCase()}</strong>{selected.data.provider && <><span>PROVIDER</span><strong>{selected.data.provider}</strong></>}{selected.data.endpoint && <><span>ENDPOINT</span><strong className="detail-value">{selected.data.endpoint}</strong></>}{selected.data.resourceType === 'vps' && <><span>SSH TARGET</span><strong>{selected.data.username}@{selected.data.host}:{selected.data.port}</strong><span>KEY STORAGE</span><strong>{selected.data.hasPrivateKey ? 'Encrypted on this server' : 'No key saved'}</strong>{selected.data.hostFingerprint && <><span>HOST KEY</span><strong className="detail-value">{selected.data.hostFingerprint}</strong></>}{selected.data.lastCheckedAt && <><span>LAST CHECK</span><strong>{new Date(selected.data.lastCheckedAt).toLocaleString()}</strong></>}</>}{selected.data.notes && <><span>NOTES</span><strong className="detail-value">{selected.data.notes}</strong></>}</div>
-      {selected.data.resourceType === 'vps' && <div className="ssh-action-block"><div className="ssh-action-buttons"><button className="secondary-button check-button" onClick={() => void runCheck(selected.id)} disabled={testBusy || isDemo}><Activity size={15} />{testBusy ? 'Checking SSH…' : 'Check SSH connection'}</button><button className="secondary-button terminal-button" onClick={() => { setTerminalNode(selected); setDetailsOpen(false) }} disabled={isDemo || !selected.data.hasPrivateKey || !selected.data.hostFingerprint}><Command size={15} />Open SSH terminal</button></div>{(!selected.data.hostFingerprint || !selected.data.hasPrivateKey) && <small>{isDemo ? 'Add a VPS before connecting.' : 'Check SSH and verify the host fingerprint before opening a terminal.'}</small>}{verification?.fingerprint && <div className="fingerprint-check"><span className="fingerprint-title">{verification.replacesExisting ? 'HOST KEY CHANGED' : 'VERIFY THIS HOST KEY'}</span>{verification.replacesExisting && <p>Saved: <code>{verification.previousFingerprint}</code></p>}<code>{verification.fingerprint}</code><p>Compare the fingerprint with the console or trusted control panel for this VPS. Continue only if it matches.</p><button className="primary-button" onClick={() => void trustFingerprint()} disabled={trustBusy}>{trustBusy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />} I verified this fingerprint</button></div>}</div>}
+      {selected.data.resourceType === 'vps' && <div className="ssh-action-block"><div className="ssh-action-buttons"><button className="secondary-button check-button" onClick={() => void runCheck(selected.id)} disabled={testBusy || isDemo}><Activity size={15} />{testBusy ? 'Checking SSH…' : 'Check SSH connection'}</button><button className="secondary-button terminal-button" onClick={() => { setTerminalNode(selected); restoreWindow('terminal'); setDetailsOpen(false) }} disabled={isDemo || !selected.data.hasPrivateKey || !selected.data.hostFingerprint}><Command size={15} />Open SSH terminal</button></div>{(!selected.data.hostFingerprint || !selected.data.hasPrivateKey) && <small>{isDemo ? 'Add a VPS before connecting.' : 'Check SSH and verify the host fingerprint before opening a terminal.'}</small>}{verification?.fingerprint && <div className="fingerprint-check"><span className="fingerprint-title">{verification.replacesExisting ? 'HOST KEY CHANGED' : 'VERIFY THIS HOST KEY'}</span>{verification.replacesExisting && <p>Saved: <code>{verification.previousFingerprint}</code></p>}<code>{verification.fingerprint}</code><p>Compare the fingerprint with the console or trusted control panel for this VPS. Continue only if it matches.</p><button className="primary-button" onClick={() => void trustFingerprint()} disabled={trustBusy}>{trustBusy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />} I verified this fingerprint</button></div>}</div>}
       {selected.data.resourceType !== 'vps' && endpointUrl(selected.data.endpoint || '') && <div className="endpoint-actions"><button className="secondary-button" disabled={isDemo} onClick={() => { const url = endpointUrl(selected.data.endpoint || ''); if (url) window.open(url, '_blank', 'noopener,noreferrer') }}><ExternalLink size={15} />Open endpoint</button></div>}
       {deleteConfirm ? <div className="delete-confirm"><span>Removing this resource also deletes its encrypted SSH key and map links.</span><div><button className="secondary-button" onClick={() => setDeleteConfirm(false)}>Keep it</button><button className="danger-button" onClick={() => void deleteNode()}><Trash2 size={14} /> Remove resource</button></div></div> : <div className="detail-actions"><span>{selected.data.resourceType === 'tunnel' || selected.data.resourceType === 'service' || selected.data.resourceType === 'external' ? 'Inventory only · no health probe configured' : selected.data.hostFingerprint ? 'Pinned host key · first-use verification complete' : 'Host key verification required on first check'}</span><button className="danger-quiet" disabled={isDemo} onClick={() => setDeleteConfirm(true)}><Trash2 size={14} /> Remove</button></div>}
-    </section></div>}
-    {terminalNode && <TerminalWindow key={terminalNode.id} nodeId={terminalNode.id} name={terminalNode.data.name} onClose={closeTerminal} />}
+    </section></WindowFrame>}
+    {terminalNode && <TerminalWindow key={terminalNode.id} nodeId={terminalNode.id} name={terminalNode.data.name} onClose={closeTerminal} desktop={desktop} focusToken={windowFocus.terminal || 0} minimized={minimizedWindows.includes('terminal')} onMinimize={() => minimizeWindow('terminal')} />}
+    {boardDialog && <WindowFrame desktop={desktop} title={boardDialog === 'add' ? 'Add graph board' : 'Rename graph'} onClose={() => { if (!boardBusy) setBoardDialog(null) }} focusToken={windowFocus.board || 0} minimized={minimizedWindows.includes('board')} onMinimize={() => minimizeWindow('board')}><form className="resource-modal board-form" onSubmit={(event) => void saveBoard(event)}><header className="modal-heading"><div><span className="modal-kicker">GRAPH BOARDS</span><h2>{boardDialog === 'add' ? 'A new place for your resources.' : 'Name this graph.'}</h2><p>{boardDialog === 'add' ? 'Keep a separate map for a location, project, or group of services.' : 'This name appears in both Map and Desktop views.'}</p></div><button type="button" className="modal-close" aria-label="Close graph form" onClick={() => setBoardDialog(null)}><X size={17} /></button></header><label className="field-label" htmlFor="board-name">Graph name<input id="board-name" className="text-input" value={boardName} onChange={(event) => setBoardName(event.target.value)} maxLength={80} placeholder="e.g. Home lab, Cloudflare, Production" required autoFocus /></label><footer className="form-footer"><button type="button" className="secondary-button" disabled={boardBusy} onClick={() => setBoardDialog(null)}>Cancel</button><button className="primary-button" type="submit" disabled={boardBusy || !boardName.trim()}>{boardBusy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{boardDialog === 'add' ? 'Create graph' : 'Save name'}</button></footer>{boardDialog === 'rename' && boardId !== 'default' && <div className="board-remove"><p>{activeBoard?.resourceCount ? 'Remove this graph’s resources before deleting the graph.' : 'This graph is empty and can be removed.'}</p><button type="button" className="danger-quiet" disabled={boardBusy || !!activeBoard?.resourceCount} onClick={() => void removeBoard()}><Trash2 size={15} />Delete empty graph</button></div>}</form></WindowFrame>}
     {message && <div className={`toast ${message.kind}`} role={message.kind === 'error' ? 'alert' : 'status'}>{message.kind === 'error' ? <X size={15} /> : <Check size={15} />}{message.text}<button onClick={() => setMessage(null)} aria-label="Dismiss"><X size={14} /></button></div>}
   </div></ReactFlowProvider>
 }
