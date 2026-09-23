@@ -7,6 +7,7 @@ const Database = require('better-sqlite3')
 const { Client } = require('ssh2')
 const { WebSocket, WebSocketServer } = require('ws')
 const installBoards = require('./boards.cjs')
+const readPrivateKey = require('./ssh-key.cjs')
 
 const production = process.env.NODE_ENV === 'production'
 const adminPassword = process.env.ADMIN_PASSWORD || (production ? '' : 'local-dev-change-me')
@@ -185,6 +186,8 @@ function toGraphNode(row) {
       provider: payload.provider || '',
       location: payload.location || '',
       notes: payload.notes || '',
+      publicKey: payload.publicKey || '',
+      keyFingerprint: payload.keyFingerprint || '',
       hasPrivateKey: Boolean(row.encrypted_key),
       hostFingerprint: row.host_fingerprint || '',
       connectionStatus: row.connection_status,
@@ -261,7 +264,10 @@ app.post('/api/nodes', (req, res) => {
       payload.port = Number(body.port || 22)
       if (!Number.isInteger(payload.port) || payload.port < 1 || payload.port > 65535) return res.status(400).json({ error: 'SSH port must be between 1 and 65535.' })
       payload.username = requireString(body.username, 'SSH user', 80)
-      encryptedKey = seal(JSON.stringify({ privateKey: requireString(body.privateKey, 'Private key', 48_000), passphrase: (body.passphrase || '').slice(0, 500) }))
+      const key = readPrivateKey(body.privateKey, body.passphrase ?? '')
+      payload.publicKey = key.publicKey
+      payload.keyFingerprint = key.keyFingerprint
+      encryptedKey = seal(JSON.stringify({ privateKey: key.privateKey, passphrase: key.passphrase }))
     } else if (type === 'tunnel' || type === 'external') {
       if (!payload.endpoint && !payload.provider) return res.status(400).json({ error: 'Add an endpoint or provider for this resource.' })
     }

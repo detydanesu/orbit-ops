@@ -7,7 +7,7 @@ A self-hosted topology dashboard for VPS hosts, services, and tunnels. It is a s
 - Map VPSes, Cloudflare Tunnels, external endpoints, and services on draggable, named graph boards.
 - Switch between Map and Desktop views using the header toggle; both share the same saved resources. Your view preference is remembered in this browser.
 - Open desktop resource windows, move or resize them, and minimize/restore them from the dock. On small screens, windows fit the viewport and forms scroll.
-- Add a VPS with SSH key authentication, check the connection, then open an interactive browser terminal over SSH.
+- Add a VPS by importing or pasting an OpenSSH private key (Ed25519, RSA, or ECDSA), including passphrase-protected keys. Invalid keys are rejected before saving. Check the connection, then open an interactive browser terminal over SSH.
 - Pin the SSH host fingerprint on first use; a changed key must be checked against the provider console before it can be trusted.
 - Store graph data in SQLite and encrypt SSH private keys and key passphrases with AES-256-GCM.
 - Keep Cloudflare and other service entries as topology inventory. They are not continuously monitored and do not call provider APIs.
@@ -63,6 +63,22 @@ curl -fsSL https://raw.githubusercontent.com/detydanesu/orbit-ops/main/deploy-sy
 ```
 
 This installs the `orbit-ops` system service with a dedicated user, listening on `127.0.0.1:8787`. It preserves generated credentials across updates in `/etc/orbit-ops/environment` (root only). Read `ADMIN_PASSWORD` there to sign in. The database lives in `/var/lib/orbit-ops`; back it up together with the environment file. Use an HTTPS reverse proxy or Cloudflare Tunnel for browser access. Rerun the same command to update.
+
+## Import an SSH config
+
+In **Add connection > VPS / SSH**, open **Import from SSH config**, choose your local `.ssh/config`, select an alias, and choose **Use this host**. HostName, User, and Port are filled in; IdentityFile is shown as a hint. Select the private-key file separately because browsers cannot automatically read local paths.
+
+The importer applies matching Host patterns and first-value precedence, including wildcard defaults. It does not execute commands or follow Include paths. Entries requiring ProxyCommand, ProxyJump, Include, or Match need manual configuration; unsupported entries are flagged instead of silently connected directly. URL-shaped HostName values are rejected. Other SSH options are not imported.
+
+## OpenSSH key-pair login
+
+1. Install your public key in `~/.ssh/authorized_keys` for the VPS account.
+2. Select **Add connection > VPS / SSH** and enter the host, port, and username.
+3. Import the private-key file (`id_ed25519`, `id_rsa`, or PEM), or paste it. Enter its passphrase if encrypted. A `.pub` file alone cannot authenticate.
+4. Saved resource details show the matching public key and login-key fingerprint. Private keys and passphrases are encrypted at rest and never returned by the API.
+5. Check SSH, verify the separate server host-key fingerprint against a trusted source, then open the terminal.
+
+This uses direct SSH from the Orbit server. Cloudflare Access SSH hostnames require a separately configured transport.
 
 ## Configuration
 
