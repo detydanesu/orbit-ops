@@ -5,12 +5,12 @@ A self-hosted topology dashboard for VPS hosts, services, and tunnels. It is a s
 ## What it does
 
 - Map VPSes, Cloudflare Tunnels, external endpoints, and services on one draggable graph.
-- Add a VPS with SSH key authentication and check that the SSH connection succeeds.
+- Add a VPS with SSH key authentication, check the connection, then open an interactive browser terminal over SSH.
 - Pin the SSH host fingerprint on first use; a changed key must be checked against the provider console before it can be trusted.
 - Store graph data in SQLite and encrypt SSH private keys and key passphrases with AES-256-GCM.
 - Keep Cloudflare and other service entries as topology inventory. They are not continuously monitored and do not call provider APIs.
 
-The dashboard host must be able to make outbound SSH connections to each VPS. The browser never opens an SSH socket and never receives a saved private key back from the server.
+The dashboard host must be able to make outbound SSH connections to each VPS. The browser never opens an SSH socket and never receives a saved private key back from the server. The terminal relays an interactive SSH shell through an authenticated, same-origin WebSocket; it is enabled only after you verify and pin the host fingerprint.
 
 ## Run locally
 
@@ -28,7 +28,7 @@ Open `http://localhost:5173`. The local development password is `local-dev-chang
 Install Docker Engine with the Compose plugin, Git, curl, and OpenSSL first. Push this source to a public GitHub repository, then run this command on the target VPS as root (replace `OWNER/REPOSITORY`):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/deploy.sh | sudo bash -s -- OWNER/REPOSITORY
+curl -fsSL https://raw.githubusercontent.com/detydanesu/orbit-ops/main/deploy.sh | sudo bash -s -- detydanesu/orbit-ops
 ```
 
 The script clones the repository into `/opt/orbit-ops`, generates the dashboard password and encryption keys once, and starts the app with Docker Compose. It prints the password once; save it securely. The web port is bound to `127.0.0.1:8787`, so it is not exposed directly to the public Internet.
@@ -56,6 +56,7 @@ docker compose up -d --build
 
 - One local administrator password controls the dashboard; there are no user accounts or remote identity integrations.
 - SSH keys are encrypted at rest using the `DATA_ENCRYPTION_KEY`. SSH host fingerprints are pinned before authentication; verify the first fingerprint through your VPS provider's console.
+- Interactive terminals use the saved key on the server and open a PTY only; the private key is not exposed to the browser. Keep dashboard access protected and close the terminal window to end its SSH session.
 - Deleting a host removes its encrypted key and graph links from the database.
 - Service and tunnel nodes are user-maintained inventory, not live status checks.
 - The published host port binds to loopback. Expose it through an HTTPS reverse proxy or Cloudflare Tunnel, not a public plain-HTTP port.

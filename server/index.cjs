@@ -1,9 +1,11 @@
 const crypto = require('node:crypto')
 const fs = require('node:fs')
+const http = require('node:http')
 const path = require('node:path')
 const express = require('express')
 const Database = require('better-sqlite3')
 const { Client } = require('ssh2')
+const { WebSocket, WebSocketServer } = require('ws')
 
 const production = process.env.NODE_ENV === 'production'
 const adminPassword = process.env.ADMIN_PASSWORD || (production ? '' : 'local-dev-change-me')
@@ -338,6 +340,112 @@ app.post('/api/nodes/:id/trust-host-key', (req, res) => {
   return res.json({ trusted: true, fingerprint: candidate.fingerprint })
 })
 
+const terminalSockets = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024, perMessageDeflate: false })
+const httpServer = http.createServer(app)
+httpServer.on('upgrade', (req, socket, head) => {
+  let requestUrl
+  try { requestUrl = new URL(req.url || '/', 'http://localhost') } catch { socket.destroy(); return }
+  if (requestUrl.pathname !== '/api/terminal') { socket.destroy(); return }
+  const origin = req.headers.origin
+  if (!origin || !req.headers.host || (() => {
+    try { return new URL(origin).host !== req.headers.host } catch { return true }
+  })()) {
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
+    socket.destroy()
+    return
+  }
+  if (!hasValidSession({ headers: req.headers })) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
+    socket.destroy()
+    return
+  }
+  const row = rowById.get(requestUrl.searchParams.get('nodeId') || '')
+  if (!row || !row.encrypted_key || !row.host_fingerprint || JSON.parse(row.payload).type !== 'vps') {
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
+    socket.destroy()
+    return
+  }
+  terminalSockets.handleUpgrade(req, socket, head, (websocket) => {
+    terminalSockets.emit('connection', websocket, req, row)
+  })
+})
+
+terminalSockets.on('connection', (websocket, _req, row) => {
+  const payload = JSON.parse(row.payload)
+  const auth = JSON.parse(unseal(row.encrypted_key))
+  const connection = new Client()
+  let shell = null
+  let closed = false
+  const send = (message) => {
+    if (websocket.readyState === WebSocket.OPEN) websocket.send(JSON.stringify(message))
+  }
+  const closeConnection = () => {
+    if (closed) return
+    closed = true
+    clearTimeout(connectTimer)
+    try { shell?.close() } catch {}
+    try { connection.end() } catch {}
+  }
+  const connectTimer = setTimeout(() => {
+    send({ type: 'error', message: 'SSH connection timed out.' })
+    websocket.close(1011, 'SSH connection timed out')
+    closeConnection()
+  }, 20_000)
+
+  websocket.on('message', (raw, isBinary) => {
+    if (isBinary || raw.length > 16 * 1024) return
+    let message
+    try { message = JSON.parse(raw.toString('utf8')) } catch { return }
+    if (message.type === 'input' && typeof message.data === 'string' && message.data.length <= 12_000) {
+      shell?.write(message.data)
+    } else if (message.type === 'resize') {
+      const cols = Math.max(10, Math.min(300, Math.floor(Number(message.cols) || 80)))
+      const rows = Math.max(5, Math.min(200, Math.floor(Number(message.rows) || 24)))
+      shell?.setWindow(rows, cols, 0, 0)
+    }
+  })
+  websocket.on('close', closeConnection)
+  websocket.on('error', closeConnection)
+  connection.on('ready', () => {
+    clearTimeout(connectTimer)
+    if (websocket.readyState !== WebSocket.OPEN) return closeConnection()
+    connection.shell({ term: 'xterm-256color', cols: 80, rows: 24 }, (error, stream) => {
+      if (error) {
+        send({ type: 'error', message: 'SSH connected, but the server did not open a terminal.' })
+        websocket.close(1011, 'Could not open SSH terminal')
+        return closeConnection()
+      }
+      shell = stream
+      send({ type: 'ready' })
+      stream.on('data', (data) => send({ type: 'output', data: data.toString('utf8') }))
+      stream.stderr.on('data', (data) => send({ type: 'output', data: data.toString('utf8') }))
+      stream.on('close', () => {
+        if (websocket.readyState === WebSocket.OPEN) websocket.close(1000, 'SSH session ended')
+        closeConnection()
+      })
+      stream.on('error', () => {
+        send({ type: 'error', message: 'The SSH terminal stream failed.' })
+        if (websocket.readyState === WebSocket.OPEN) websocket.close(1011, 'SSH terminal stream failed')
+        closeConnection()
+      })
+    })
+  })
+  connection.on('error', () => {
+    send({ type: 'error', message: 'SSH authentication failed or the pinned host key changed. Run the connection check to review the host key.' })
+    if (websocket.readyState === WebSocket.OPEN) websocket.close(1011, 'SSH connection failed')
+    closeConnection()
+  })
+  connection.connect({
+    host: payload.host,
+    port: payload.port,
+    username: payload.username,
+    privateKey: auth.privateKey,
+    passphrase: auth.passphrase || undefined,
+    readyTimeout: 18_000,
+    hostVerifier: (hostKey) => safeEqual(sshFingerprint(hostKey), row.host_fingerprint),
+  })
+})
+
 const publicDirectory = path.join(__dirname, '..', 'dist')
 if (fs.existsSync(publicDirectory)) {
   app.use(express.static(publicDirectory, { index: false, maxAge: '1h' }))
@@ -354,4 +462,4 @@ app.use((error, _req, res, _next) => {
 
 const port = Number(process.env.PORT || 8787)
 const bindHost = process.env.HOST || (production ? '0.0.0.0' : '127.0.0.1')
-app.listen(port, bindHost, () => console.log(`Orbit Ops listening on ${bindHost}:${port}`))
+httpServer.listen(port, bindHost, () => console.log(`Orbit Ops listening on ${bindHost}:${port}`))

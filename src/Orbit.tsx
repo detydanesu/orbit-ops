@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type MouseEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from 'react'
 import {
   addEdge, Background, BackgroundVariant, Controls, Handle, MiniMap, Position,
   ReactFlow, ReactFlowProvider, type Connection, type Edge, type Node, type NodeProps,
@@ -7,9 +7,10 @@ import {
 import {
   Activity, ArrowDownRight, ArrowUpRight, Box, Cable, Check, Cloud, Command, Database,
   Globe2, KeyRound, Layers3, LoaderCircle, LogOut, Plus, Server, ShieldCheck,
-  Trash2, Waypoints, X,
+  ExternalLink, Trash2, Waypoints, X,
 } from 'lucide-react'
 import '@xyflow/react/dist/style.css'
+import '@xterm/xterm/css/xterm.css'
 import './Dashboard.css'
 import './Orbit.css'
 import './Canvas.css'
@@ -50,6 +51,82 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const payload = response.status === 204 ? undefined : await response.json().catch(() => ({}))
   if (!response.ok) throw new Error(payload?.error || `Request failed (${response.status}).`)
   return payload as T
+}
+
+function endpointUrl(value: string) {
+  const input = value.trim()
+  if (!input || input.startsWith('//')) return null
+  if (/^[a-z][a-z\d+.-]*:/i.test(input) && !/^https?:\/\//i.test(input) && !/^[a-z][a-z\d.-]*(?::\d+)?(?:\/|$)/i.test(input)) return null
+  try {
+    const url = new URL(/^https?:\/\//i.test(input) ? input : `https://${input}`)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : null
+  } catch { return null }
+}
+
+function TerminalWindow({ nodeId, name, onClose }: { nodeId: string; name: string; onClose: () => void }) {
+  const hostRef = useRef<HTMLDivElement>(null)
+  const [status, setStatus] = useState('Connecting')
+
+  useEffect(() => {
+    if (!hostRef.current) return
+    let disposed = false
+    let cleanup = () => undefined
+    void (async () => {
+      const [{ Terminal }, { FitAddon }] = await Promise.all([import('@xterm/xterm'), import('@xterm/addon-fit')])
+      if (disposed || !hostRef.current) return
+      const terminal = new Terminal({
+        cursorBlink: true,
+        convertEol: true,
+        fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+        fontSize: 13,
+        theme: { background: '#0a1016', foreground: '#dce7ef', cursor: '#55d5cb', selectionBackground: '#244149', black: '#111820', brightBlack: '#647687', green: '#79d9af', brightGreen: '#9becbc', red: '#ef8c8c', brightRed: '#ffaaaa', blue: '#77aeea', brightBlue: '#a5c8ff', yellow: '#eac77f', brightYellow: '#f7df9e' },
+      })
+      const fit = new FitAddon()
+      terminal.loadAddon(fit)
+      terminal.open(hostRef.current)
+      const socketUrl = new URL('/api/terminal', window.location.href)
+      socketUrl.protocol = socketUrl.protocol === 'https:' ? 'wss:' : 'ws:'
+      socketUrl.searchParams.set('nodeId', nodeId)
+      const socket = new WebSocket(socketUrl)
+      let frame = 0
+      const syncSize = () => {
+        if (socket.readyState !== WebSocket.OPEN) return
+        try { fit.fit(); socket.send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows })) } catch { /* the terminal can be between layout sizes */ }
+      }
+      const onData = terminal.onData((data) => {
+        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'input', data }))
+      })
+      socket.onopen = () => {
+        setStatus('SSH connected · opening terminal')
+        frame = window.requestAnimationFrame(syncSize)
+      }
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(String(event.data)) as { type?: string; data?: string; message?: string }
+          if (message.type === 'ready') { setStatus('Connected'); syncSize() }
+          else if (message.type === 'output' && typeof message.data === 'string') terminal.write(message.data)
+          else if (message.type === 'error' && typeof message.message === 'string') terminal.write(`\r\n\x1b[31m${message.message}\x1b[0m\r\n`)
+        } catch { terminal.write('\r\n\x1b[31mReceived an invalid terminal response.\x1b[0m\r\n') }
+      }
+      socket.onerror = () => setStatus('Connection error')
+      socket.onclose = () => setStatus('Disconnected')
+      const observer = new ResizeObserver(() => { cancelAnimationFrame(frame); frame = requestAnimationFrame(syncSize) })
+      observer.observe(hostRef.current)
+      cleanup = () => {
+        cancelAnimationFrame(frame)
+        observer.disconnect()
+        onData.dispose()
+        if (socket.readyState < WebSocket.CLOSING) socket.close()
+        terminal.dispose()
+      }
+    })()
+    return () => {
+      disposed = true
+      cleanup()
+    }
+  }, [nodeId])
+
+  return <div className="modal-backdrop terminal-backdrop"><section className="terminal-modal" role="dialog" aria-modal="true" aria-label={`SSH terminal for ${name}`}><header className="terminal-heading"><div><span className="modal-kicker">SSH SESSION</span><h2>{name}</h2><p><i className={status === 'Connected' ? 'terminal-live' : ''} />{status}</p></div><button className="modal-close" onClick={onClose} aria-label="Close terminal"><X size={17} /></button></header><div ref={hostRef} className="terminal-screen" /><footer className="terminal-footer"><span>SSH · XTERM-256COLOR</span><span>SESSION ENDS WHEN THIS WINDOW CLOSES</span></footer></section></div>
 }
 
 function ResourceNodeView({ data, selected }: NodeProps<ResourceNode>) {
@@ -94,6 +171,7 @@ function App() {
   const [selectedId, setSelectedId] = useState<string | null>(sampleNodes[0].id)
   const [addOpen, setAddOpen] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
+  const [terminalNode, setTerminalNode] = useState<ResourceNode | null>(null)
   const [draft, setDraft] = useState<Draft>(blankDraft)
   const [saveBusy, setSaveBusy] = useState(false)
   const [testBusy, setTestBusy] = useState(false)
@@ -104,6 +182,7 @@ function App() {
   const [viewport, setViewport] = useState({ x: 0, y: 0, zoom: 1 })
   const realNodes = useMemo(() => nodes.filter((node) => !node.id.startsWith('sample-')), [nodes])
   const selected = nodes.find((node) => node.id === selectedId) || null
+  const closeTerminal = useCallback(() => setTerminalNode(null), [])
   const vpsNodes = nodes.filter((node) => node.data.resourceType === 'vps' && !node.id.startsWith('sample-'))
   const hostCount = nodes.filter((node) => node.data.resourceType === 'vps').length
   const tunnelCount = nodes.filter((node) => node.data.resourceType === 'tunnel').length
@@ -214,9 +293,11 @@ function App() {
 
     {detailsOpen && selected && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) { setDetailsOpen(false); setDeleteConfirm(false) } }}><section className="details-modal"><header className="modal-heading"><div><span className="modal-kicker">{selected.data.kind}</span><h2>{selected.data.name}</h2><p>{selected.data.meta}</p></div><button className="modal-close" onClick={() => { setDetailsOpen(false); setDeleteConfirm(false) }} aria-label="Close"><X size={17} /></button></header>
       <div className="detail-grid"><span>TYPE</span><strong>{selected.data.resourceType.toUpperCase()}</strong>{selected.data.provider && <><span>PROVIDER</span><strong>{selected.data.provider}</strong></>}{selected.data.endpoint && <><span>ENDPOINT</span><strong className="detail-value">{selected.data.endpoint}</strong></>}{selected.data.resourceType === 'vps' && <><span>SSH TARGET</span><strong>{selected.data.username}@{selected.data.host}:{selected.data.port}</strong><span>KEY STORAGE</span><strong>{selected.data.hasPrivateKey ? 'Encrypted on this server' : 'No key saved'}</strong>{selected.data.hostFingerprint && <><span>HOST KEY</span><strong className="detail-value">{selected.data.hostFingerprint}</strong></>}{selected.data.lastCheckedAt && <><span>LAST CHECK</span><strong>{new Date(selected.data.lastCheckedAt).toLocaleString()}</strong></>}</>}{selected.data.notes && <><span>NOTES</span><strong className="detail-value">{selected.data.notes}</strong></>}</div>
-      {selected.data.resourceType === 'vps' && <div className="ssh-action-block"><button className="secondary-button check-button" onClick={() => void runCheck(selected.id)} disabled={testBusy || isDemo}><Activity size={15} />{testBusy ? 'Checking SSH…' : 'Check SSH connection'}</button>{isDemo && <small>Save your own host before running a check.</small>}{verification?.fingerprint && <div className="fingerprint-check"><span className="fingerprint-title">{verification.replacesExisting ? 'HOST KEY CHANGED' : 'VERIFY THIS HOST KEY'}</span>{verification.replacesExisting && <p>Saved: <code>{verification.previousFingerprint}</code></p>}<code>{verification.fingerprint}</code><p>Compare the fingerprint with the console or trusted control panel for this VPS. Continue only if it matches.</p><button className="primary-button" onClick={() => void trustFingerprint()} disabled={trustBusy}>{trustBusy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />} I verified this fingerprint</button></div>}</div>}
+      {selected.data.resourceType === 'vps' && <div className="ssh-action-block"><div className="ssh-action-buttons"><button className="secondary-button check-button" onClick={() => void runCheck(selected.id)} disabled={testBusy || isDemo}><Activity size={15} />{testBusy ? 'Checking SSH…' : 'Check SSH connection'}</button><button className="secondary-button terminal-button" onClick={() => { setTerminalNode(selected); setDetailsOpen(false) }} disabled={isDemo || !selected.data.hasPrivateKey || !selected.data.hostFingerprint}><Command size={15} />Open SSH terminal</button></div>{(!selected.data.hostFingerprint || !selected.data.hasPrivateKey) && <small>{isDemo ? 'Add a VPS before connecting.' : 'Check SSH and verify the host fingerprint before opening a terminal.'}</small>}{verification?.fingerprint && <div className="fingerprint-check"><span className="fingerprint-title">{verification.replacesExisting ? 'HOST KEY CHANGED' : 'VERIFY THIS HOST KEY'}</span>{verification.replacesExisting && <p>Saved: <code>{verification.previousFingerprint}</code></p>}<code>{verification.fingerprint}</code><p>Compare the fingerprint with the console or trusted control panel for this VPS. Continue only if it matches.</p><button className="primary-button" onClick={() => void trustFingerprint()} disabled={trustBusy}>{trustBusy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />} I verified this fingerprint</button></div>}</div>}
+      {selected.data.resourceType !== 'vps' && endpointUrl(selected.data.endpoint || '') && <div className="endpoint-actions"><button className="secondary-button" disabled={isDemo} onClick={() => { const url = endpointUrl(selected.data.endpoint || ''); if (url) window.open(url, '_blank', 'noopener,noreferrer') }}><ExternalLink size={15} />Open endpoint</button></div>}
       {deleteConfirm ? <div className="delete-confirm"><span>Removing this resource also deletes its encrypted SSH key and map links.</span><div><button className="secondary-button" onClick={() => setDeleteConfirm(false)}>Keep it</button><button className="danger-button" onClick={() => void deleteNode()}><Trash2 size={14} /> Remove resource</button></div></div> : <div className="detail-actions"><span>{selected.data.resourceType === 'tunnel' || selected.data.resourceType === 'service' || selected.data.resourceType === 'external' ? 'Inventory only · no health probe configured' : selected.data.hostFingerprint ? 'Pinned host key · first-use verification complete' : 'Host key verification required on first check'}</span><button className="danger-quiet" disabled={isDemo} onClick={() => setDeleteConfirm(true)}><Trash2 size={14} /> Remove</button></div>}
     </section></div>}
+    {terminalNode && <TerminalWindow key={terminalNode.id} nodeId={terminalNode.id} name={terminalNode.data.name} onClose={closeTerminal} />}
     {message && <div className={`toast ${message.kind}`} role={message.kind === 'error' ? 'alert' : 'status'}>{message.kind === 'error' ? <X size={15} /> : <Check size={15} />}{message.text}<button onClick={() => setMessage(null)} aria-label="Dismiss"><X size={14} /></button></div>}
   </div></ReactFlowProvider>
 }
