@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import { parseSshConfig, type SshProfile } from './sshConfig'
 
-export type StoredSshProfile = SshProfile & { id: string; configName: string }
+export type StoredSshProfile = SshProfile & { id: string; configName: string; uploadFileName: string; context: string }
 
 export default function SshConfigImport({ onSelect, savedProfiles, onSave, onDelete }: {
   onSelect: (profile: SshProfile) => void
   savedProfiles: StoredSshProfile[]
-  onSave: (configName: string, profiles: SshProfile[]) => Promise<void>
+  onSave: (configName: string, uploadFileName: string, profiles: SshProfile[]) => Promise<void>
   onDelete: (configName: string) => Promise<void>
 }) {
   const [profiles, setProfiles] = useState<SshProfile[]>([])
   const [configName, setConfigName] = useState('')
+  const [uploadFileName, setUploadFileName] = useState('')
   const [selection, setSelection] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -26,7 +27,7 @@ export default function SshConfigImport({ onSelect, savedProfiles, onSave, onDel
       const file = event.target.files?.[0], version = ++revision.current
       event.target.value = ''
       if (!file) return
-      setError(''); setProfiles([]); setSelection(''); setConfigName(file.name.replace(/\.[^.]+$/, '').slice(0, 80))
+      setError(''); setProfiles([]); setSelection(''); setUploadFileName(file.name); setConfigName(file.name.replace(/\.[^.]+$/, '').slice(0, 80))
       if (file.size > 256000) { setError('Choose an SSH config file smaller than 256 KB.'); return }
       try {
         const source = await file.text()
@@ -36,7 +37,7 @@ export default function SshConfigImport({ onSelect, savedProfiles, onSave, onDel
         setProfiles(parsed); setSelection(parsed[0].alias)
       } catch { if (version === revision.current) setError('Could not read the SSH config file.') }
     }} /></label>
-    {profiles.length > 0 && <><label className="field-label" htmlFor="ssh-config-name">Save config as<input id="ssh-config-name" className="text-input" value={configName} onChange={(event) => setConfigName(event.target.value)} maxLength={80} required /></label><button type="button" className="secondary-button" disabled={saving || !configName.trim()} onClick={async () => { setSaving(true); setError(''); try { await onSave(configName.trim(), profiles); setProfiles([]); setSelection('') } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not save this config.') } finally { setSaving(false) } }}>{saving ? 'Saving config…' : `Save ${profiles.length} host aliases`}</button><label className="field-label" htmlFor="ssh-config-host">Host alias<select id="ssh-config-host" className="text-input" value={saved ? '' : selection} onChange={(event) => setSelection(event.target.value)}>{profiles.map((profile) => <option key={profile.alias} value={profile.alias}>{profile.alias}{profile.problems.length ? ' — needs review' : ''}</option>)}</select></label></>}
+    {profiles.length > 0 && <><p className="key-help">Selected file: <code>{uploadFileName}</code></p><label className="field-label" htmlFor="ssh-config-name">Save config as<input id="ssh-config-name" className="text-input" value={configName} onChange={(event) => setConfigName(event.target.value)} maxLength={80} required /></label><button type="button" className="secondary-button" disabled={saving || !configName.trim()} onClick={async () => { setSaving(true); setError(''); try { await onSave(configName.trim(), uploadFileName, profiles); setProfiles([]); setSelection('') } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not save this config.') } finally { setSaving(false) } }}>{saving ? 'Saving config…' : `Save ${profiles.length} host aliases`}</button><label className="field-label" htmlFor="ssh-config-host">Host alias<select id="ssh-config-host" className="text-input" value={saved ? '' : selection} onChange={(event) => setSelection(event.target.value)}>{profiles.map((profile) => <option key={profile.alias} value={profile.alias}>{profile.alias}{profile.problems.length ? ' — needs review' : ''}</option>)}</select></label></>}
     {error && <p className="key-file-error" role="alert">{error}</p>}
     {selected && <div className="ssh-config-preview"><p>{selected.username || '(choose user)'}@{selected.host}:{selected.port}</p>{selected.identityFiles.map((file) => <p key={file} className="key-help">IdentityFile: <code>{file}</code></p>)}{selected.problems.map((problem) => <p key={problem} className="key-file-error">{problem}</p>)}<p className="key-help">HostName, User, and Port are imported. Other SSH options are not applied. Select or save the matching private key below.</p><button type="button" className="secondary-button" disabled={selected.problems.length > 0} onClick={() => onSelect(selected)}>{saved ? 'Use saved host' : 'Use this host'}</button></div>}
     {names.map((name) => <button key={name} type="button" className="danger-quiet" onClick={() => void onDelete(name)}>Delete saved config “{name}”</button>)}

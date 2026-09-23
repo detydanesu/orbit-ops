@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-export default function SshKeyField({ value, onChange, hint, required = true }: { hint?: string; value: string; required?: boolean; onChange: (value: string) => void }) {
+export default function SshKeyField({ value, onChange, hint, required = true }: { hint?: string; value: string; required?: boolean; onChange: (value: string, fileName?: string) => void }) {
   const [error, setError] = useState('')
   const [filename, setFilename] = useState('')
   const revision = useRef(0)
@@ -19,7 +19,7 @@ export default function SshKeyField({ value, onChange, hint, required = true }: 
           const text = await file.text()
           if (version !== revision.current) return
           if (!/-----BEGIN (?:OPENSSH |RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----/.test(text)) { setError('Choose your private key, such as id_ed25519 or id_rsa, rather than its .pub file.'); return }
-          onChange(text); setFilename(file.name)
+          onChange(text, file.name); setFilename(file.name)
         } catch { if (version === revision.current) setError('Could not read this file. Try selecting it again.') }
       }} />
     </label>

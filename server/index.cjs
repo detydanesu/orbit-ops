@@ -53,15 +53,20 @@ installBoards(database)
 database.exec(`
   CREATE TABLE IF NOT EXISTS ssh_identities (
     id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, public_key TEXT NOT NULL,
-    key_fingerprint TEXT NOT NULL, encrypted_key TEXT NOT NULL, created_at TEXT NOT NULL
+    key_fingerprint TEXT NOT NULL, encrypted_key TEXT NOT NULL, upload_file_name TEXT NOT NULL DEFAULT '',
+    context TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS ssh_profiles (
     id TEXT PRIMARY KEY, config_name TEXT NOT NULL, alias TEXT NOT NULL,
     host TEXT NOT NULL, username TEXT NOT NULL, port INTEGER NOT NULL,
-    identity_files TEXT NOT NULL, problems TEXT NOT NULL, created_at TEXT NOT NULL,
+    identity_files TEXT NOT NULL, problems TEXT NOT NULL, upload_file_name TEXT NOT NULL DEFAULT '',
+    context TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
     UNIQUE(config_name, alias)
   );
 `)
+for (const [table, column] of [['ssh_identities', 'upload_file_name'], ['ssh_identities', 'context'], ['ssh_profiles', 'upload_file_name'], ['ssh_profiles', 'context']]) {
+  if (!database.pragma(`table_info(${table})`).some((entry) => entry.name === column)) database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`)
+}
 
 const app = express()
 app.disable('x-powered-by')
@@ -136,17 +141,18 @@ app.use('/api', (req, res, next) => {
   next()
 })
 
-const listSshIdentities = () => database.prepare('SELECT id, name, public_key AS publicKey, key_fingerprint AS keyFingerprint, created_at AS createdAt FROM ssh_identities ORDER BY name COLLATE NOCASE').all()
-const listSshProfiles = () => database.prepare('SELECT id, config_name AS configName, alias, host, username, port, identity_files AS identityFilesJson, problems AS problemsJson FROM ssh_profiles ORDER BY config_name COLLATE NOCASE, alias COLLATE NOCASE').all().map((profile) => ({ ...profile, identityFiles: JSON.parse(profile.identityFilesJson), problems: JSON.parse(profile.problemsJson), identityFilesJson: undefined, problemsJson: undefined }))
+const listSshIdentities = () => database.prepare('SELECT id, name, public_key AS publicKey, key_fingerprint AS keyFingerprint, upload_file_name AS uploadFileName, context, created_at AS createdAt FROM ssh_identities ORDER BY name COLLATE NOCASE').all()
+const listSshProfiles = () => database.prepare('SELECT id, config_name AS configName, alias, host, username, port, identity_files AS identityFilesJson, problems AS problemsJson, upload_file_name AS uploadFileName, context FROM ssh_profiles ORDER BY config_name COLLATE NOCASE, alias COLLATE NOCASE').all().map((profile) => ({ ...profile, identityFiles: JSON.parse(profile.identityFilesJson), problems: JSON.parse(profile.problemsJson), identityFilesJson: undefined, problemsJson: undefined }))
 
 app.get('/api/ssh-identities', (_req, res) => res.json({ identities: listSshIdentities() }))
 app.post('/api/ssh-identities', (req, res) => {
   try {
     const name = requireString(req.body?.name, 'Key name', 80)
+    const uploadFileName = typeof req.body?.uploadFileName === 'string' ? req.body.uploadFileName.replace(/[\\/]/g, '/').split('/').pop().trim().slice(0, 180) : ''
     const key = readPrivateKey(req.body?.privateKey, req.body?.passphrase ?? '')
     const id = crypto.randomUUID(), createdAt = new Date().toISOString()
     try {
-      database.prepare('INSERT INTO ssh_identities (id, name, public_key, key_fingerprint, encrypted_key, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, name, key.publicKey, key.keyFingerprint, seal(JSON.stringify({ privateKey: key.privateKey, passphrase: key.passphrase })), createdAt)
+      database.prepare('INSERT INTO ssh_identities (id, name, public_key, key_fingerprint, encrypted_key, upload_file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, name, key.publicKey, key.keyFingerprint, seal(JSON.stringify({ privateKey: key.privateKey, passphrase: key.passphrase })), uploadFileName, createdAt)
     } catch (error) {
       if (String(error.code).startsWith('SQLITE_CONSTRAINT')) return res.status(409).json({ error: 'A saved key already uses that name. Choose another name.' })
       throw error
@@ -158,11 +164,19 @@ app.delete('/api/ssh-identities/:id', (req, res) => {
   const result = database.prepare('DELETE FROM ssh_identities WHERE id = ?').run(req.params.id)
   return result.changes ? res.status(204).end() : res.status(404).json({ error: 'Saved SSH key not found.' })
 })
+app.patch('/api/ssh-identities/:id/context', (req, res) => {
+  const identity = database.prepare('SELECT id FROM ssh_identities WHERE id = ?').get(req.params.id)
+  if (!identity) return res.status(404).json({ error: 'Saved SSH key not found.' })
+  if (typeof req.body?.context !== 'string' || req.body.context.length > 1000) return res.status(400).json({ error: 'File context must be 1000 characters or fewer.' })
+  database.prepare('UPDATE ssh_identities SET context = ? WHERE id = ?').run(req.body.context.trim(), identity.id)
+  return res.json({ identity: listSshIdentities().find((entry) => entry.id === identity.id) })
+})
 
 app.get('/api/ssh-profiles', (_req, res) => res.json({ profiles: listSshProfiles() }))
 app.post('/api/ssh-profiles', (req, res) => {
   try {
     const configName = requireString(req.body?.configName, 'Config name', 80)
+    const uploadFileName = typeof req.body?.uploadFileName === 'string' ? req.body.uploadFileName.replace(/[\\/]/g, '/').split('/').pop().trim().slice(0, 180) : ''
     const profiles = req.body?.profiles
     if (!Array.isArray(profiles) || profiles.length < 1 || profiles.length > 100) throw new Error('Choose a config with 1 to 100 named host aliases.')
     const createdAt = new Date().toISOString()
@@ -176,11 +190,11 @@ app.post('/api/ssh-profiles', (req, res) => {
       const port = Number(profile.port || 22)
       if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`Port for ${alias} must be between 1 and 65535.`)
       const identityFiles = Array.isArray(profile.identityFiles) ? profile.identityFiles.slice(0, 8).map((file) => requireString(file, 'Identity file', 320)) : []
-      return [crypto.randomUUID(), configName, alias, host, username, port, JSON.stringify(identityFiles), JSON.stringify(problems), createdAt]
+      return [crypto.randomUUID(), configName, alias, host, username, port, JSON.stringify(identityFiles), JSON.stringify(problems), uploadFileName, createdAt]
     })
     const replaceConfig = database.transaction(() => {
       database.prepare('DELETE FROM ssh_profiles WHERE config_name = ?').run(configName)
-      const insert = database.prepare('INSERT INTO ssh_profiles (id, config_name, alias, host, username, port, identity_files, problems, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      const insert = database.prepare('INSERT INTO ssh_profiles (id, config_name, alias, host, username, port, identity_files, problems, upload_file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       for (const row of rows) insert.run(...row)
     })
     replaceConfig()
@@ -193,6 +207,11 @@ app.post('/api/ssh-profiles', (req, res) => {
 app.delete('/api/ssh-profiles/:configName', (req, res) => {
   const result = database.prepare('DELETE FROM ssh_profiles WHERE config_name = ?').run(req.params.configName)
   return result.changes ? res.status(204).end() : res.status(404).json({ error: 'Saved SSH config not found.' })
+})
+app.patch('/api/ssh-profiles/:configName/context', (req, res) => {
+  if (typeof req.body?.context !== 'string' || req.body.context.length > 1000) return res.status(400).json({ error: 'File context must be 1000 characters or fewer.' })
+  const result = database.prepare('UPDATE ssh_profiles SET context = ? WHERE config_name = ?').run(req.body.context.trim(), req.params.configName)
+  return result.changes ? res.json({ profiles: listSshProfiles().filter((profile) => profile.configName === req.params.configName) }) : res.status(404).json({ error: 'Saved SSH config not found.' })
 })
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }))
@@ -348,7 +367,8 @@ app.post('/api/nodes', (req, res) => {
         encryptedKey = seal(JSON.stringify({ privateKey: key.privateKey, passphrase: key.passphrase }))
         if (body.rememberSshKey === true) {
           payload.rememberSshKeyName = requireString(body.rememberSshKeyName, 'Saved key name', 80)
-          payload.rememberSshIdentity = { publicKey: key.publicKey, keyFingerprint: key.keyFingerprint, encryptedKey }
+          const uploadFileName = typeof body.sshKeyUploadFileName === 'string' ? body.sshKeyUploadFileName.replace(/[\\/]/g, '/').split('/').pop().trim().slice(0, 180) : ''
+          payload.rememberSshIdentity = { publicKey: key.publicKey, keyFingerprint: key.keyFingerprint, encryptedKey, uploadFileName }
         }
       }
     } else if (type === 'tunnel' || type === 'external') {
@@ -358,7 +378,7 @@ app.post('/api/nodes', (req, res) => {
     database.transaction(() => {
       if (payload.rememberSshIdentity) {
         const saved = payload.rememberSshIdentity
-        database.prepare('INSERT INTO ssh_identities (id, name, public_key, key_fingerprint, encrypted_key, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(crypto.randomUUID(), payload.rememberSshKeyName, saved.publicKey, saved.keyFingerprint, saved.encryptedKey, now)
+        database.prepare('INSERT INTO ssh_identities (id, name, public_key, key_fingerprint, encrypted_key, upload_file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(crypto.randomUUID(), payload.rememberSshKeyName, saved.publicKey, saved.keyFingerprint, saved.encryptedKey, saved.uploadFileName, now)
         delete payload.rememberSshIdentity
         delete payload.rememberSshKeyName
       }
