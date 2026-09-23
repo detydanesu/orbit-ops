@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 # Native Linux deployment for hosts with Node.js 24+ and systemd.
 [[ "$(id -u)" == 0 ]] || { echo "Run this script as root." >&2; exit 1; }
@@ -22,6 +23,7 @@ id orbit-ops >/dev/null 2>&1 || useradd --system --home-dir /var/lib/orbit-ops -
 install -d -m 700 /etc/orbit-ops
 install -d -m 700 -o orbit-ops -g orbit-ops /var/lib/orbit-ops
 if [[ ! -e /etc/orbit-ops/environment ]]; then
+  (
   umask 077
   cat > /etc/orbit-ops/environment <<EOF
 NODE_ENV=production
@@ -33,11 +35,14 @@ ADMIN_PASSWORD=$(openssl rand -hex 24)
 SESSION_SECRET=$(openssl rand -hex 32)
 DATA_ENCRYPTION_KEY=$(openssl rand -hex 32)
 EOF
+  )
 fi
 cd "$app_dir"
 npm ci
 npm run build
 npm prune --omit=dev
+# Make build outputs readable by the dedicated service user, including on repair.
+chmod -R a+rX "$app_dir/dist" "$app_dir/node_modules"
 node_binary="$(command -v node)"
 cat > /etc/systemd/system/orbit-ops.service <<EOF
 [Unit]
