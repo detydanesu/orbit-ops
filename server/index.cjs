@@ -50,11 +50,23 @@ database.exec(`
 `)
 
 installBoards(database)
+database.exec(`
+  CREATE TABLE IF NOT EXISTS ssh_identities (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, public_key TEXT NOT NULL,
+    key_fingerprint TEXT NOT NULL, encrypted_key TEXT NOT NULL, created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS ssh_profiles (
+    id TEXT PRIMARY KEY, config_name TEXT NOT NULL, alias TEXT NOT NULL,
+    host TEXT NOT NULL, username TEXT NOT NULL, port INTEGER NOT NULL,
+    identity_files TEXT NOT NULL, problems TEXT NOT NULL, created_at TEXT NOT NULL,
+    UNIQUE(config_name, alias)
+  );
+`)
 
 const app = express()
 app.disable('x-powered-by')
 app.set('trust proxy', 1)
-app.use(express.json({ limit: '64kb' }))
+app.use(express.json({ limit: '512kb' }))
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('Referrer-Policy', 'same-origin')
@@ -122,6 +134,65 @@ app.use('/api', (req, res, next) => {
     }
   }
   next()
+})
+
+const listSshIdentities = () => database.prepare('SELECT id, name, public_key AS publicKey, key_fingerprint AS keyFingerprint, created_at AS createdAt FROM ssh_identities ORDER BY name COLLATE NOCASE').all()
+const listSshProfiles = () => database.prepare('SELECT id, config_name AS configName, alias, host, username, port, identity_files AS identityFilesJson, problems AS problemsJson FROM ssh_profiles ORDER BY config_name COLLATE NOCASE, alias COLLATE NOCASE').all().map((profile) => ({ ...profile, identityFiles: JSON.parse(profile.identityFilesJson), problems: JSON.parse(profile.problemsJson), identityFilesJson: undefined, problemsJson: undefined }))
+
+app.get('/api/ssh-identities', (_req, res) => res.json({ identities: listSshIdentities() }))
+app.post('/api/ssh-identities', (req, res) => {
+  try {
+    const name = requireString(req.body?.name, 'Key name', 80)
+    const key = readPrivateKey(req.body?.privateKey, req.body?.passphrase ?? '')
+    const id = crypto.randomUUID(), createdAt = new Date().toISOString()
+    try {
+      database.prepare('INSERT INTO ssh_identities (id, name, public_key, key_fingerprint, encrypted_key, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, name, key.publicKey, key.keyFingerprint, seal(JSON.stringify({ privateKey: key.privateKey, passphrase: key.passphrase })), createdAt)
+    } catch (error) {
+      if (String(error.code).startsWith('SQLITE_CONSTRAINT')) return res.status(409).json({ error: 'A saved key already uses that name. Choose another name.' })
+      throw error
+    }
+    return res.status(201).json({ identity: listSshIdentities().find((identity) => identity.id === id) })
+  } catch (error) { return res.status(400).json({ error: error.message || 'Could not save this SSH key.' }) }
+})
+app.delete('/api/ssh-identities/:id', (req, res) => {
+  const result = database.prepare('DELETE FROM ssh_identities WHERE id = ?').run(req.params.id)
+  return result.changes ? res.status(204).end() : res.status(404).json({ error: 'Saved SSH key not found.' })
+})
+
+app.get('/api/ssh-profiles', (_req, res) => res.json({ profiles: listSshProfiles() }))
+app.post('/api/ssh-profiles', (req, res) => {
+  try {
+    const configName = requireString(req.body?.configName, 'Config name', 80)
+    const profiles = req.body?.profiles
+    if (!Array.isArray(profiles) || profiles.length < 1 || profiles.length > 100) throw new Error('Choose a config with 1 to 100 named host aliases.')
+    const createdAt = new Date().toISOString()
+    const rows = profiles.map((profile) => {
+      const alias = requireString(profile?.alias, 'Host alias', 100)
+      const host = requireString(profile?.host, 'Host', 253)
+      const problems = Array.isArray(profile.problems) ? profile.problems.slice(0, 10).map((problem) => requireString(problem, 'SSH config warning', 300)) : []
+      const invalidHostname = /[\s/?#]/.test(host) || host.includes('://')
+      if (invalidHostname && !problems.some((problem) => problem.startsWith('HostName must be a hostname or IP address'))) throw new Error(`HostName for ${alias} must be a hostname or IP address.`)
+      const username = typeof profile.username === 'string' ? profile.username.trim().slice(0, 80) : ''
+      const port = Number(profile.port || 22)
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`Port for ${alias} must be between 1 and 65535.`)
+      const identityFiles = Array.isArray(profile.identityFiles) ? profile.identityFiles.slice(0, 8).map((file) => requireString(file, 'Identity file', 320)) : []
+      return [crypto.randomUUID(), configName, alias, host, username, port, JSON.stringify(identityFiles), JSON.stringify(problems), createdAt]
+    })
+    const replaceConfig = database.transaction(() => {
+      database.prepare('DELETE FROM ssh_profiles WHERE config_name = ?').run(configName)
+      const insert = database.prepare('INSERT INTO ssh_profiles (id, config_name, alias, host, username, port, identity_files, problems, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      for (const row of rows) insert.run(...row)
+    })
+    replaceConfig()
+    return res.status(201).json({ profiles: listSshProfiles().filter((profile) => profile.configName === configName) })
+  } catch (error) {
+    if (String(error.code).startsWith('SQLITE_CONSTRAINT')) return res.status(400).json({ error: 'Host aliases in this config must be unique.' })
+    return res.status(400).json({ error: error.message || 'Could not save this SSH config.' })
+  }
+})
+app.delete('/api/ssh-profiles/:configName', (req, res) => {
+  const result = database.prepare('DELETE FROM ssh_profiles WHERE config_name = ?').run(req.params.configName)
+  return result.changes ? res.status(204).end() : res.status(404).json({ error: 'Saved SSH config not found.' })
 })
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }))
@@ -264,15 +335,33 @@ app.post('/api/nodes', (req, res) => {
       payload.port = Number(body.port || 22)
       if (!Number.isInteger(payload.port) || payload.port < 1 || payload.port > 65535) return res.status(400).json({ error: 'SSH port must be between 1 and 65535.' })
       payload.username = requireString(body.username, 'SSH user', 80)
-      const key = readPrivateKey(body.privateKey, body.passphrase ?? '')
-      payload.publicKey = key.publicKey
-      payload.keyFingerprint = key.keyFingerprint
-      encryptedKey = seal(JSON.stringify({ privateKey: key.privateKey, passphrase: key.passphrase }))
+      if (typeof body.sshIdentityId === 'string' && body.sshIdentityId) {
+        const identity = database.prepare('SELECT * FROM ssh_identities WHERE id = ?').get(body.sshIdentityId)
+        if (!identity) return res.status(400).json({ error: 'Choose a saved SSH key that still exists.' })
+        payload.publicKey = identity.public_key
+        payload.keyFingerprint = identity.key_fingerprint
+        encryptedKey = identity.encrypted_key
+      } else {
+        const key = readPrivateKey(body.privateKey, body.passphrase ?? '')
+        payload.publicKey = key.publicKey
+        payload.keyFingerprint = key.keyFingerprint
+        encryptedKey = seal(JSON.stringify({ privateKey: key.privateKey, passphrase: key.passphrase }))
+        if (body.rememberSshKey === true) {
+          payload.rememberSshKeyName = requireString(body.rememberSshKeyName, 'Saved key name', 80)
+          payload.rememberSshIdentity = { publicKey: key.publicKey, keyFingerprint: key.keyFingerprint, encryptedKey }
+        }
+      }
     } else if (type === 'tunnel' || type === 'external') {
       if (!payload.endpoint && !payload.provider) return res.status(400).json({ error: 'Add an endpoint or provider for this resource.' })
     }
     const now = new Date().toISOString()
     database.transaction(() => {
+      if (payload.rememberSshIdentity) {
+        const saved = payload.rememberSshIdentity
+        database.prepare('INSERT INTO ssh_identities (id, name, public_key, key_fingerprint, encrypted_key, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(crypto.randomUUID(), payload.rememberSshKeyName, saved.publicKey, saved.keyFingerprint, saved.encryptedKey, now)
+        delete payload.rememberSshIdentity
+        delete payload.rememberSshKeyName
+      }
       database.prepare('INSERT INTO nodes (id, payload, encrypted_key, x, y, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, JSON.stringify(payload), encryptedKey, x, y, now)
       database.prepare('INSERT INTO board_nodes (node_id, board_id) VALUES (?, ?)').run(id, boardId)
       if (body.parentId && body.parentId !== id) {

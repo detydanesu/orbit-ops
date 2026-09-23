@@ -68,14 +68,14 @@ This installs the `orbit-ops` system service with a dedicated user, listening on
 
 In **Add connection > VPS / SSH**, open **Import from SSH config**, choose your local `.ssh/config`, select an alias, and choose **Use this host**. HostName, User, and Port are filled in; IdentityFile is shown as a hint. Select the private-key file separately because browsers cannot automatically read local paths.
 
-The importer applies matching Host patterns and first-value precedence, including wildcard defaults. It does not execute commands or follow Include paths. Entries requiring ProxyCommand, ProxyJump, Include, or Match need manual configuration; unsupported entries are flagged instead of silently connected directly. URL-shaped HostName values are rejected. Other SSH options are not imported.
+After selecting a config, choose **Save N host aliases** to store its parsed host settings for future VPS entries. Saved aliases remain in the SSH setup library until deleted. The importer applies matching Host patterns and first-value precedence, including wildcard defaults. It does not execute commands or follow Include paths. Entries requiring ProxyCommand, ProxyJump, Include, or Match are saved with a warning and disabled for selection until configured manually. URL-shaped HostName values are also retained as flagged entries. Other SSH options are not imported.
 
 ## OpenSSH key-pair login
 
 1. Install your public key in `~/.ssh/authorized_keys` for the VPS account.
 2. Select **Add connection > VPS / SSH** and enter the host, port, and username.
 3. Import the private-key file (`id_ed25519`, `id_rsa`, or PEM), or paste it. Enter its passphrase if encrypted. A `.pub` file alone cannot authenticate.
-4. Saved resource details show the matching public key and login-key fingerprint. Private keys and passphrases are encrypted at rest and never returned by the API.
+4. Choose **Save key for reuse** after importing to add the key to the SSH library, or select **Save this key to the library when adding this VPS**. Later, select a saved key in the VPS form. Saved resource details show the matching public key and login-key fingerprint. Private keys and passphrases are encrypted at rest and never returned by the API.
 5. Check SSH, verify the separate server host-key fingerprint against a trusted source, then open the terminal.
 
 This uses direct SSH from the Orbit server. Cloudflare Access SSH hostnames require a separately configured transport.

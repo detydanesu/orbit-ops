@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-export default function SshKeyField({ value, onChange, hint }: { hint?: string; value: string; onChange: (value: string) => void }) {
+export default function SshKeyField({ value, onChange, hint, required = true }: { hint?: string; value: string; required?: boolean; onChange: (value: string) => void }) {
   const [error, setError] = useState('')
   const [filename, setFilename] = useState('')
   const revision = useRef(0)
@@ -27,6 +27,6 @@ export default function SshKeyField({ value, onChange, hint }: { hint?: string; 
     <p className="key-help">Choose id_ed25519, id_rsa, or a PEM private key, or paste it below. Add the matching public key to the VPS user’s ~/.ssh/authorized_keys.</p>
     {filename && <p className="key-help" role="status">Loaded: {filename}</p>}
     {error && <p className="key-file-error" role="alert">{error}</p>}
-    <label className="field-label" htmlFor="ssh-key">Private key<textarea id="ssh-key" className="text-input key-input" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" value={value} onChange={(event) => { ++revision.current; setFilename(''); setError(''); onChange(event.target.value) }} spellCheck={false} autoComplete="off" autoCapitalize="none" required /></label>
+    <label className="field-label" htmlFor="ssh-key">Private key<textarea id="ssh-key" className="text-input key-input" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" value={value} onChange={(event) => { ++revision.current; setFilename(''); setError(''); onChange(event.target.value) }} spellCheck={false} autoComplete="off" autoCapitalize="none" required={required} /></label>
   </div>
 }

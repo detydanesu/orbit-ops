@@ -18,7 +18,7 @@ import './Workspace.css'
 import Desktop from './Desktop'
 import WindowFrame from './WindowFrame'
 import SshKeyField from './SshKeyField'
-import SshConfigImport from './SshConfigImport'
+import SshConfigImport, { type StoredSshProfile } from './SshConfigImport'
 
 type ResourceType = 'vps' | 'service' | 'tunnel' | 'external'
 type ResourceData = {
@@ -31,6 +31,7 @@ type ResourceData = {
 }
 type ResourceNode = Node<ResourceData>
 type GraphBoard = { id: string; name: string; resourceCount: number }
+type StoredSshIdentity = { id: string; name: string; publicKey: string; keyFingerprint: string; createdAt: string }
 type GraphResponse = { nodes: ResourceNode[]; edges: Edge[]; demo: boolean; boards: GraphBoard[]; boardId: string }
 type LoginResponse = { authenticated: boolean }
 type SshResult = { ok: boolean; error?: string; needsTrust?: boolean; fingerprint?: string; replacesExisting?: boolean; previousFingerprint?: string; checkedAt?: string }
@@ -190,6 +191,12 @@ function App() {
   const [addOpen, setAddOpen] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [terminalNode, setTerminalNode] = useState<ResourceNode | null>(null)
+  const [sshIdentities, setSshIdentities] = useState<StoredSshIdentity[]>([])
+  const [sshProfiles, setSshProfiles] = useState<StoredSshProfile[]>([])
+  const [selectedIdentityId, setSelectedIdentityId] = useState('')
+  const [rememberSshKey, setRememberSshKey] = useState(false)
+  const [rememberSshKeyName, setRememberSshKeyName] = useState('')
+  const [sshLibraryBusy, setSshLibraryBusy] = useState(false)
   const [identityHint, setIdentityHint] = useState('')
   const [draft, setDraft] = useState<Draft>(blankDraft)
   const [saveBusy, setSaveBusy] = useState(false)
@@ -240,7 +247,42 @@ function App() {
     try { await loadGraph() } catch (error) { notify(error instanceof Error ? error.message : 'Could not load the map.', 'error') }
   }
   const openDetails = (id = selectedId) => { if (boardLoading || !id) return; setSelectedId(id); setVerification(null); setDeleteConfirm(false); restoreWindow('details'); setDetailsOpen(true) }
-  const openAdd = () => { if (boardLoading) return; setIdentityHint(''); setDraft(blankDraft); setMessage(null); restoreWindow('add'); setAddOpen(true) }
+  const refreshSshLibrary = async () => {
+    const [identities, configs] = await Promise.all([request<{ identities: StoredSshIdentity[] }>('/ssh-identities'), request<{ profiles: StoredSshProfile[] }>('/ssh-profiles')])
+    setSshIdentities(identities.identities); setSshProfiles(configs.profiles)
+  }
+  const openAdd = () => {
+    if (boardLoading) return
+    setIdentityHint(''); setDraft(blankDraft); setSelectedIdentityId(''); setRememberSshKey(false); setRememberSshKeyName(''); setMessage(null); restoreWindow('add'); setAddOpen(true)
+    void refreshSshLibrary().catch((error) => notify(error instanceof Error ? error.message : 'Could not load saved SSH setups.', 'error'))
+  }
+  const saveSshConfig = async (configName: string, profiles: Array<Omit<StoredSshProfile, 'id' | 'configName'>>) => {
+    setSshLibraryBusy(true)
+    try {
+      const result = await request<{ profiles: StoredSshProfile[] }>('/ssh-profiles', { method: 'POST', body: JSON.stringify({ configName, profiles }) })
+      setSshProfiles((current) => [...current.filter((profile) => profile.configName !== configName), ...result.profiles])
+      notify(`Saved ${result.profiles.length} SSH host aliases.`)
+    } finally { setSshLibraryBusy(false) }
+  }
+  const deleteSshConfig = async (configName: string) => {
+    await request(`/ssh-profiles/${encodeURIComponent(configName)}`, { method: 'DELETE' })
+    setSshProfiles((current) => current.filter((profile) => profile.configName !== configName)); notify(`Deleted SSH config ${configName}.`)
+  }
+  const saveSshIdentity = async () => {
+    if (!rememberSshKeyName.trim()) { notify('Enter a name for this saved SSH key.', 'error'); return }
+    setSshLibraryBusy(true)
+    try {
+      const result = await request<{ identity: StoredSshIdentity }>('/ssh-identities', { method: 'POST', body: JSON.stringify({ name: rememberSshKeyName, privateKey: draft.privateKey, passphrase: draft.passphrase }) })
+      setSshIdentities((current) => [...current, result.identity].sort((a, b) => a.name.localeCompare(b.name)))
+      setSelectedIdentityId(result.identity.id); setDraft((current) => ({ ...current, privateKey: '', passphrase: '' })); setRememberSshKey(false)
+      notify('Encrypted SSH key saved. Choose it from this list next time.')
+    } catch (error) { notify(error instanceof Error ? error.message : 'Could not save this SSH key.', 'error') }
+    finally { setSshLibraryBusy(false) }
+  }
+  const deleteSshIdentity = async (id: string) => {
+    await request(`/ssh-identities/${id}`, { method: 'DELETE' })
+    setSshIdentities((current) => current.filter((identity) => identity.id !== id)); if (selectedIdentityId === id) setSelectedIdentityId(''); notify('Saved SSH key deleted.')
+  }
   const openBoardDialog = (mode: 'add' | 'rename') => { setBoardName(mode === 'rename' ? activeBoard?.name || '' : ''); restoreWindow('board'); setBoardDialog(mode) }
   const switchBoard = async (id: string) => {
     if (id === boardId || boardLoading || saveBusy || testBusy || trustBusy || boardBusy) return
@@ -268,9 +310,10 @@ function App() {
     event.preventDefault(); setSaveBusy(true); setMessage(null)
     const x = 90 + (realNodes.length % 3) * 278
     const y = 110 + (Math.floor(realNodes.length / 3) % 2) * 205
-    const body = { ...draft, privateKey: draft.type === 'vps' ? draft.privateKey : undefined, passphrase: draft.type === 'vps' ? draft.passphrase : undefined, boardId, port: Number(draft.port || 22), x, y, parentId: draft.parentId || undefined }
+    const body = { ...draft, privateKey: draft.type === 'vps' && !selectedIdentityId ? draft.privateKey : undefined, passphrase: draft.type === 'vps' && !selectedIdentityId ? draft.passphrase : undefined, sshIdentityId: draft.type === 'vps' ? (selectedIdentityId || undefined) : undefined, rememberSshKey: draft.type === 'vps' && rememberSshKey && !selectedIdentityId, rememberSshKeyName: draft.type === 'vps' && rememberSshKey && !selectedIdentityId ? rememberSshKeyName : undefined, boardId, port: Number(draft.port || 22), x, y, parentId: draft.parentId || undefined }
     try {
       await request('/nodes', { method: 'POST', body: JSON.stringify(body) })
+      if (rememberSshKey && !selectedIdentityId && draft.type === 'vps') await refreshSshLibrary()
       setDraft(blankDraft); setAddOpen(false); setVerification(null); await loadGraph(); notify('Resource added to the map.')
     } catch (error) { notify(error instanceof Error ? error.message : 'Could not save this resource.', 'error') }
     finally { setSaveBusy(false) }
@@ -317,7 +360,7 @@ function App() {
   }
   const signOut = async () => {
     try { await request('/session', { method: 'DELETE' }) } catch { /* the next request will require a fresh sign-in */ }
-    ++graphRequest.current; boardRef.current = 'default'; setBoardId('default'); setBoards([]); setDetailsOpen(false); setAddOpen(false); setTerminalNode(null); setBoardDialog(null); setMinimizedWindows([])
+    ++graphRequest.current; boardRef.current = 'default'; setBoardId('default'); setBoards([]); setSshIdentities([]); setSshProfiles([]); setSelectedIdentityId(''); setDetailsOpen(false); setAddOpen(false); setTerminalNode(null); setBoardDialog(null); setMinimizedWindows([])
     setAuthenticated(false); setNodes(sampleNodes); setEdges(sampleEdges); setIsDemo(true); setSelectedId(sampleNodes[0].id)
   }
 
@@ -354,9 +397,9 @@ function App() {
     {addOpen && <WindowFrame desktop={desktop} title="Add connection" onClose={() => { if (!saveBusy) setAddOpen(false) }} focusToken={windowFocus.add || 0} minimized={minimizedWindows.includes('add')} onMinimize={() => minimizeWindow('add')}><form className="resource-modal" onSubmit={(event) => void addNode(event)}><header className="modal-heading"><div><span className="modal-kicker">MAP INVENTORY</span><h2>Add a resource</h2><p>Add to {activeBoard?.name || 'this graph'}.</p></div><button type="button" className="modal-close" onClick={() => setAddOpen(false)} aria-label="Close"><X size={17} /></button></header>
       <div className="type-switch" role="group" aria-label="Resource type"><button type="button" className={draft.type === 'vps' ? 'selected' : ''} onClick={() => { setIdentityHint(''); setDraft({ ...blankDraft, type: 'vps' }) }}><Server size={15} /> VPS / SSH</button><button type="button" className={draft.type !== 'vps' ? 'selected' : ''} onClick={() => setDraft({ ...draft, type: draft.type === 'vps' ? 'service' : draft.type })}><Layers3 size={15} /> SERVICE / TUNNEL</button></div>
       {draft.type !== 'vps' && <label className="field-label" htmlFor="resource-type">Resource type<select id="resource-type" className="text-input" value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value as ResourceType, provider: event.target.value === 'tunnel' ? 'Cloudflare' : '' })}><option value="service">Service</option><option value="tunnel">Cloudflare Tunnel</option><option value="external">External service</option></select></label>}
-      {draft.type === 'vps' && <SshConfigImport onSelect={(profile) => { setDraft((current) => ({ ...current, name: profile.alias, host: profile.host, port: profile.port, username: profile.username, privateKey: '', passphrase: '' })); setIdentityHint(profile.identityFiles.join(' or ')); notify('Host settings imported. Select its private-key file below.'); }} />}
+      {draft.type === 'vps' && <SshConfigImport savedProfiles={sshProfiles} onSave={saveSshConfig} onDelete={deleteSshConfig} onSelect={(profile) => { setDraft((current) => ({ ...current, name: profile.alias, host: profile.host, port: profile.port, username: profile.username, privateKey: '', passphrase: '' })); setSelectedIdentityId(''); setRememberSshKey(false); setIdentityHint(profile.identityFiles.join(' or ')); notify('Host settings imported. Choose or save its private key below.'); }} />}
       <label className="field-label" htmlFor="resource-name">Name<input id="resource-name" className="text-input" placeholder={draft.type === 'vps' ? 'e.g. Singapore edge' : draft.type === 'tunnel' ? 'e.g. Public ingress' : 'e.g. PostgreSQL'} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} maxLength={180} required autoFocus /></label>
-      {draft.type === 'vps' ? <><div className="field-row"><label className="field-label" htmlFor="ssh-host">Host / IP<input id="ssh-host" className="text-input" placeholder="203.0.113.10" value={draft.host} onChange={(event) => setDraft({ ...draft, host: event.target.value })} autoComplete="off" required /></label><label className="field-label port-field" htmlFor="ssh-port">Port<input id="ssh-port" className="text-input" inputMode="numeric" value={draft.port} onChange={(event) => setDraft({ ...draft, port: event.target.value })} required /></label></div><div className="field-row"><label className="field-label" htmlFor="ssh-user">SSH username<input id="ssh-user" className="text-input" placeholder="root" value={draft.username} onChange={(event) => setDraft({ ...draft, username: event.target.value })} autoComplete="off" required /></label><label className="field-label" htmlFor="ssh-location">Location <span className="optional-label">OPTIONAL</span><input id="ssh-location" className="text-input" placeholder="Singapore" value={draft.location} onChange={(event) => setDraft({ ...draft, location: event.target.value })} /></label></div>{import.meta.env.DEV && <div className="dev-warning">Local development mode uses a fixed encryption key. Do not save real SSH keys here.</div>}<SshKeyField key={identityHint + draft.host} hint={identityHint} value={draft.privateKey} onChange={(privateKey) => setDraft((current) => ({ ...current, privateKey }))} /><label className="field-label" htmlFor="ssh-passphrase">Key passphrase <span className="optional-label">IF ENCRYPTED</span><input id="ssh-passphrase" className="text-input" type="password" autoComplete="new-password" value={draft.passphrase} onChange={(event) => setDraft({ ...draft, passphrase: event.target.value })} /></label><div className="security-note"><ShieldCheck size={15} /><span>The private key and passphrase are encrypted before they are stored on this server. They are never sent to the browser again.</span></div></> : <><div className="field-row"><label className="field-label" htmlFor="resource-provider">Provider<input id="resource-provider" className="text-input" placeholder={draft.type === 'tunnel' ? 'Cloudflare' : 'Docker, AWS…'} value={draft.provider} onChange={(event) => setDraft({ ...draft, provider: event.target.value })} /></label><label className="field-label" htmlFor="resource-endpoint">Endpoint<input id="resource-endpoint" className="text-input" placeholder="https://… or localhost:port" value={draft.endpoint} onChange={(event) => setDraft({ ...draft, endpoint: event.target.value })} /></label></div>{vpsNodes.length > 0 && <label className="field-label" htmlFor="resource-parent">Connected to <span className="optional-label">OPTIONAL</span><select id="resource-parent" className="text-input" value={draft.parentId} onChange={(event) => setDraft({ ...draft, parentId: event.target.value })}><option value="">No host link yet</option>{vpsNodes.map((node) => <option key={node.id} value={node.id}>{node.data.name}</option>)}</select></label>}<label className="field-label" htmlFor="resource-notes">Notes <span className="optional-label">OPTIONAL</span><textarea id="resource-notes" className="text-input notes-input" placeholder="Where it runs, which service it routes to, or other context." value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></label><div className="security-note"><Cloud size={15} /><span>Tunnels and services are saved as topology records. This does not query their provider APIs or monitor health.</span></div></>}
+      {draft.type === 'vps' ? <><div className="field-row"><label className="field-label" htmlFor="ssh-host">Host / IP<input id="ssh-host" className="text-input" placeholder="203.0.113.10" value={draft.host} onChange={(event) => setDraft({ ...draft, host: event.target.value })} autoComplete="off" required /></label><label className="field-label port-field" htmlFor="ssh-port">Port<input id="ssh-port" className="text-input" inputMode="numeric" value={draft.port} onChange={(event) => setDraft({ ...draft, port: event.target.value })} required /></label></div><div className="field-row"><label className="field-label" htmlFor="ssh-user">SSH username<input id="ssh-user" className="text-input" placeholder="root" value={draft.username} onChange={(event) => setDraft({ ...draft, username: event.target.value })} autoComplete="off" required /></label><label className="field-label" htmlFor="ssh-location">Location <span className="optional-label">OPTIONAL</span><input id="ssh-location" className="text-input" placeholder="Singapore" value={draft.location} onChange={(event) => setDraft({ ...draft, location: event.target.value })} /></label></div>{import.meta.env.DEV && <div className="dev-warning">Local development mode uses a fixed encryption key. Do not save real SSH keys here.</div>}{sshIdentities.length > 0 && <div className="saved-identity-picker"><label className="field-label" htmlFor="saved-ssh-key">Saved private key<select id="saved-ssh-key" className="text-input" value={selectedIdentityId} onChange={(event) => { setSelectedIdentityId(event.target.value); setDraft((current) => ({ ...current, privateKey: '', passphrase: '' })); setRememberSshKey(false) }}><option value="">Upload or paste another key…</option>{sshIdentities.filter((identity) => identity.id).map((identity) => <option key={identity.id} value={identity.id}>{identity.name} · {identity.keyFingerprint}</option>)}</select></label>{selectedIdentityId && <button type="button" className="danger-quiet" disabled={sshLibraryBusy} onClick={() => void deleteSshIdentity(selectedIdentityId)}>Delete selected saved key</button>}</div>}{selectedIdentityId ? <div className="security-note"><KeyRound size={15} /><span>Saved key selected. Its encrypted key stays on the server and is reused for this VPS.</span></div> : <><SshKeyField key={identityHint + draft.host} hint={identityHint} value={draft.privateKey} onChange={(privateKey) => setDraft((current) => ({ ...current, privateKey }))} /><label className="field-label" htmlFor="ssh-passphrase">Key passphrase <span className="optional-label">IF ENCRYPTED</span><input id="ssh-passphrase" className="text-input" type="password" autoComplete="new-password" value={draft.passphrase} onChange={(event) => setDraft((current) => ({ ...current, passphrase: event.target.value }))} /></label>{draft.privateKey.trim() && <div className="store-key-now"><label className="field-label" htmlFor="ssh-key-library-name">Save key in library as<input id="ssh-key-library-name" className="text-input" value={rememberSshKeyName} onChange={(event) => setRememberSshKeyName(event.target.value)} maxLength={80} placeholder="e.g. Main Ed25519" /></label><button type="button" className="secondary-button" disabled={sshLibraryBusy || !rememberSshKeyName.trim()} onClick={() => void saveSshIdentity()}>{sshLibraryBusy ? 'Saving key…' : 'Save key for reuse'}</button></div>}<label className="remember-ssh-key"><input type="checkbox" checked={rememberSshKey} onChange={(event) => setRememberSshKey(event.target.checked)} />Save this key to the library when adding this VPS</label>{rememberSshKey && <label className="field-label" htmlFor="remember-key-name">Saved key name<input id="remember-key-name" className="text-input" value={rememberSshKeyName} onChange={(event) => setRememberSshKeyName(event.target.value)} maxLength={80} placeholder="e.g. Main Ed25519" required /></label>}<div className="security-note"><ShieldCheck size={15} /><span>The private key and passphrase are encrypted before storage. Private keys are never returned by the server.</span></div></>}</> : <><div className="field-row"><label className="field-label" htmlFor="resource-provider">Provider<input id="resource-provider" className="text-input" placeholder={draft.type === 'tunnel' ? 'Cloudflare' : 'Docker, AWS…'} value={draft.provider} onChange={(event) => setDraft({ ...draft, provider: event.target.value })} /></label><label className="field-label" htmlFor="resource-endpoint">Endpoint<input id="resource-endpoint" className="text-input" placeholder="https://… or localhost:port" value={draft.endpoint} onChange={(event) => setDraft({ ...draft, endpoint: event.target.value })} /></label></div>{vpsNodes.length > 0 && <label className="field-label" htmlFor="resource-parent">Connected to <span className="optional-label">OPTIONAL</span><select id="resource-parent" className="text-input" value={draft.parentId} onChange={(event) => setDraft({ ...draft, parentId: event.target.value })}><option value="">No host link yet</option>{vpsNodes.map((node) => <option key={node.id} value={node.id}>{node.data.name}</option>)}</select></label>}<label className="field-label" htmlFor="resource-notes">Notes <span className="optional-label">OPTIONAL</span><textarea id="resource-notes" className="text-input notes-input" placeholder="Where it runs, which service it routes to, or other context." value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></label><div className="security-note"><Cloud size={15} /><span>Tunnels and services are saved as topology records. This does not query their provider APIs or monitor health.</span></div></>}
       <footer className="form-footer"><span>ADDED TO YOUR LOCAL MAP</span><button type="button" className="secondary-button" onClick={() => setAddOpen(false)} disabled={saveBusy}>Cancel</button><button type="submit" className="primary-button" disabled={saveBusy}>{saveBusy ? <LoaderCircle size={16} className="spin" /> : <Plus size={15} />} Add resource</button></footer>
     </form></WindowFrame>}
 
