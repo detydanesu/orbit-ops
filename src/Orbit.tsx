@@ -19,7 +19,7 @@ import Desktop from './Desktop'
 import WindowFrame from './WindowFrame'
 import SshKeyField from './SshKeyField'
 import SshConfigImport, { type StoredSshProfile } from './SshConfigImport'
-import SshLibrary from './SshLibrary'
+import SshLibrary, { type StoredSshKeyFile } from './SshLibrary'
 
 type ResourceType = 'vps' | 'service' | 'tunnel' | 'external'
 type ResourceData = {
@@ -193,6 +193,7 @@ function App() {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [terminalNode, setTerminalNode] = useState<ResourceNode | null>(null)
   const [sshIdentities, setSshIdentities] = useState<StoredSshIdentity[]>([])
+  const [sshFiles, setSshFiles] = useState<StoredSshKeyFile[]>([])
   const [sshProfiles, setSshProfiles] = useState<StoredSshProfile[]>([])
   const [selectedIdentityId, setSelectedIdentityId] = useState('')
   const [rememberSshKey, setRememberSshKey] = useState(false)
@@ -251,8 +252,8 @@ function App() {
   }
   const openDetails = (id = selectedId) => { if (boardLoading || !id) return; setSelectedId(id); setVerification(null); setDeleteConfirm(false); restoreWindow('details'); setDetailsOpen(true) }
   const refreshSshLibrary = async () => {
-    const [identities, configs] = await Promise.all([request<{ identities: StoredSshIdentity[] }>('/ssh-identities'), request<{ profiles: StoredSshProfile[] }>('/ssh-profiles')])
-    setSshIdentities(identities.identities); setSshProfiles(configs.profiles)
+    const [identities, configs, files] = await Promise.all([request<{ identities: StoredSshIdentity[] }>('/ssh-identities'), request<{ profiles: StoredSshProfile[] }>('/ssh-profiles'), request<{ files: StoredSshKeyFile[] }>('/ssh-files')])
+    setSshIdentities(identities.identities); setSshProfiles(configs.profiles); setSshFiles(files.files)
   }
   const openSshLibrary = async () => {
     try { await refreshSshLibrary(); setSshLibraryOpen(true); restoreWindow('ssh-library') }
@@ -281,24 +282,35 @@ function App() {
     try {
       const result = await request<{ identity: StoredSshIdentity }>('/ssh-identities', { method: 'POST', body: JSON.stringify({ name: rememberSshKeyName, privateKey: draft.privateKey, passphrase: draft.passphrase, uploadFileName: sshKeyUploadFileName }) })
       setSshIdentities((current) => [...current, result.identity].sort((a, b) => a.name.localeCompare(b.name)))
-      setSelectedIdentityId(result.identity.id); setDraft((current) => ({ ...current, privateKey: '', passphrase: '' })); setSshKeyUploadFileName(''); setRememberSshKey(false)
+      setSelectedIdentityId(result.identity.id); setDraft((current) => ({ ...current, privateKey: '', passphrase: '' })); setSshKeyUploadFileName(''); setRememberSshKey(false); await refreshSshLibrary()
       notify('Encrypted SSH key saved. Choose it from this list next time.')
     } catch (error) { notify(error instanceof Error ? error.message : 'Could not save this SSH key.', 'error') }
     finally { setSshLibraryBusy(false) }
   }
   const deleteSshIdentity = async (id: string) => {
     await request(`/ssh-identities/${id}`, { method: 'DELETE' })
-    setSshIdentities((current) => current.filter((identity) => identity.id !== id)); if (selectedIdentityId === id) setSelectedIdentityId(''); notify('Saved SSH key deleted.')
+    setSshIdentities((current) => current.filter((identity) => identity.id !== id)); if (selectedIdentityId === id) setSelectedIdentityId(''); await refreshSshLibrary(); notify('Saved SSH key deleted.')
   }
   const saveSshProfileContext = async (configName: string, context: string) => {
     const result = await request<{ profiles: StoredSshProfile[] }>(`/ssh-profiles/${encodeURIComponent(configName)}/context`, { method: 'PATCH', body: JSON.stringify({ context }) })
     setSshProfiles((current) => [...current.filter((profile) => profile.configName !== configName), ...result.profiles])
     notify('SSH config context saved.')
   }
-  const saveSshIdentityContext = async (id: string, context: string) => {
-    const result = await request<{ identity: StoredSshIdentity }>(`/ssh-identities/${encodeURIComponent(id)}/context`, { method: 'PATCH', body: JSON.stringify({ context }) })
-    setSshIdentities((current) => current.map((identity) => identity.id === id ? result.identity : identity))
+  const saveSshIdentityContext = async (identity: StoredSshKeyFile, context: string) => {
+    if (identity.source === 'vps') {
+      await request(`/nodes/${encodeURIComponent(identity.id)}/ssh-file-context`, { method: 'PATCH', body: JSON.stringify({ context }) })
+      setSshFiles((current) => current.map((file) => file.id === identity.id && file.source === 'vps' ? { ...file, context } : file))
+    } else {
+      const result = await request<{ identity: StoredSshIdentity }>(`/ssh-identities/${encodeURIComponent(identity.id)}/context`, { method: 'PATCH', body: JSON.stringify({ context }) })
+      setSshIdentities((current) => current.map((item) => item.id === identity.id ? result.identity : item))
+      setSshFiles((current) => current.map((file) => file.id === identity.id && file.source === 'library' ? { ...file, context } : file))
+    }
     notify('SSH key context saved.')
+  }
+  const deleteSshNodeKey = async (nodeId: string) => {
+    await request(`/nodes/${encodeURIComponent(nodeId)}/ssh-key`, { method: 'DELETE' })
+    await Promise.all([loadGraph(), refreshSshLibrary()])
+    notify('SSH key removed from the VPS.')
   }
   const openBoardDialog = (mode: 'add' | 'rename') => { setBoardName(mode === 'rename' ? activeBoard?.name || '' : ''); restoreWindow('board'); setBoardDialog(mode) }
   const switchBoard = async (id: string) => {
@@ -327,10 +339,10 @@ function App() {
     event.preventDefault(); setSaveBusy(true); setMessage(null)
     const x = 90 + (realNodes.length % 3) * 278
     const y = 110 + (Math.floor(realNodes.length / 3) % 2) * 205
-    const body = { ...draft, privateKey: draft.type === 'vps' && !selectedIdentityId ? draft.privateKey : undefined, passphrase: draft.type === 'vps' && !selectedIdentityId ? draft.passphrase : undefined, sshIdentityId: draft.type === 'vps' ? (selectedIdentityId || undefined) : undefined, rememberSshKey: draft.type === 'vps' && rememberSshKey && !selectedIdentityId, rememberSshKeyName: draft.type === 'vps' && rememberSshKey && !selectedIdentityId ? rememberSshKeyName : undefined, sshKeyUploadFileName: draft.type === 'vps' && rememberSshKey && !selectedIdentityId ? sshKeyUploadFileName : undefined, boardId, port: Number(draft.port || 22), x, y, parentId: draft.parentId || undefined }
+    const body = { ...draft, privateKey: draft.type === 'vps' && !selectedIdentityId ? draft.privateKey : undefined, passphrase: draft.type === 'vps' && !selectedIdentityId ? draft.passphrase : undefined, sshIdentityId: draft.type === 'vps' ? (selectedIdentityId || undefined) : undefined, rememberSshKey: draft.type === 'vps' && rememberSshKey && !selectedIdentityId, rememberSshKeyName: draft.type === 'vps' && rememberSshKey && !selectedIdentityId ? rememberSshKeyName : undefined, sshKeyUploadFileName: draft.type === 'vps' && !selectedIdentityId ? sshKeyUploadFileName : undefined, boardId, port: Number(draft.port || 22), x, y, parentId: draft.parentId || undefined }
     try {
       await request('/nodes', { method: 'POST', body: JSON.stringify(body) })
-      if (rememberSshKey && !selectedIdentityId && draft.type === 'vps') await refreshSshLibrary()
+      if (draft.type === 'vps') await refreshSshLibrary()
       setDraft(blankDraft); setAddOpen(false); setVerification(null); await loadGraph(); notify('Resource added to the map.')
     } catch (error) { notify(error instanceof Error ? error.message : 'Could not save this resource.', 'error') }
     finally { setSaveBusy(false) }
@@ -377,7 +389,7 @@ function App() {
   }
   const signOut = async () => {
     try { await request('/session', { method: 'DELETE' }) } catch { /* the next request will require a fresh sign-in */ }
-    ++graphRequest.current; boardRef.current = 'default'; setBoardId('default'); setBoards([]); setSshIdentities([]); setSshProfiles([]); setSelectedIdentityId(''); setSshLibraryOpen(false); setDetailsOpen(false); setAddOpen(false); setTerminalNode(null); setBoardDialog(null); setMinimizedWindows([])
+    ++graphRequest.current; boardRef.current = 'default'; setBoardId('default'); setBoards([]); setSshIdentities([]); setSshFiles([]); setSshProfiles([]); setSelectedIdentityId(''); setSshLibraryOpen(false); setDetailsOpen(false); setAddOpen(false); setTerminalNode(null); setBoardDialog(null); setMinimizedWindows([])
     setAuthenticated(false); setNodes(sampleNodes); setEdges(sampleEdges); setIsDemo(true); setSelectedId(sampleNodes[0].id)
   }
 
@@ -429,7 +441,7 @@ function App() {
     </section></WindowFrame>}
     {terminalNode && <TerminalWindow key={terminalNode.id} nodeId={terminalNode.id} name={terminalNode.data.name} onClose={closeTerminal} desktop={desktop} focusToken={windowFocus.terminal || 0} minimized={minimizedWindows.includes('terminal')} onMinimize={() => minimizeWindow('terminal')} />}
     {boardDialog && <WindowFrame desktop={desktop} title={boardDialog === 'add' ? 'Add graph board' : 'Rename graph'} onClose={() => { if (!boardBusy) setBoardDialog(null) }} focusToken={windowFocus.board || 0} minimized={minimizedWindows.includes('board')} onMinimize={() => minimizeWindow('board')}><form className="resource-modal board-form" onSubmit={(event) => void saveBoard(event)}><header className="modal-heading"><div><span className="modal-kicker">GRAPH BOARDS</span><h2>{boardDialog === 'add' ? 'A new place for your resources.' : 'Name this graph.'}</h2><p>{boardDialog === 'add' ? 'Keep a separate map for a location, project, or group of services.' : 'This name appears in both Map and Desktop views.'}</p></div><button type="button" className="modal-close" aria-label="Close graph form" onClick={() => setBoardDialog(null)}><X size={17} /></button></header><label className="field-label" htmlFor="board-name">Graph name<input id="board-name" className="text-input" value={boardName} onChange={(event) => setBoardName(event.target.value)} maxLength={80} placeholder="e.g. Home lab, Cloudflare, Production" required autoFocus /></label><footer className="form-footer"><button type="button" className="secondary-button" disabled={boardBusy} onClick={() => setBoardDialog(null)}>Cancel</button><button className="primary-button" type="submit" disabled={boardBusy || !boardName.trim()}>{boardBusy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{boardDialog === 'add' ? 'Create graph' : 'Save name'}</button></footer>{boardDialog === 'rename' && boardId !== 'default' && <div className="board-remove"><p>{activeBoard?.resourceCount ? 'Remove this graph’s resources before deleting the graph.' : 'This graph is empty and can be removed.'}</p><button type="button" className="danger-quiet" disabled={boardBusy || !!activeBoard?.resourceCount} onClick={() => void removeBoard()}><Trash2 size={15} />Delete empty graph</button></div>}</form></WindowFrame>}
-    {sshLibraryOpen && <SshLibrary desktop={desktop} minimized={minimizedWindows.includes('ssh-library')} focusToken={windowFocus['ssh-library'] || 0} profiles={sshProfiles} identities={sshIdentities} onClose={() => setSshLibraryOpen(false)} onMinimize={() => minimizeWindow('ssh-library')} onSaveProfileContext={saveSshProfileContext} onSaveIdentityContext={saveSshIdentityContext} onDeleteProfile={deleteSshConfig} onDeleteIdentity={deleteSshIdentity} />}
+    {sshLibraryOpen && <SshLibrary desktop={desktop} minimized={minimizedWindows.includes('ssh-library')} focusToken={windowFocus['ssh-library'] || 0} profiles={sshProfiles} identities={sshFiles} onClose={() => setSshLibraryOpen(false)} onMinimize={() => minimizeWindow('ssh-library')} onSaveProfileContext={saveSshProfileContext} onSaveIdentityContext={saveSshIdentityContext} onDeleteProfile={deleteSshConfig} onDeleteIdentity={(identity) => deleteSshIdentity(identity.id)} onDeleteAttachedKey={deleteSshNodeKey} />}
     {message && <div className={`toast ${message.kind}`} role={message.kind === 'error' ? 'alert' : 'status'}>{message.kind === 'error' ? <X size={15} /> : <Check size={15} />}{message.text}<button onClick={() => setMessage(null)} aria-label="Dismiss"><X size={14} /></button></div>}
   </div></ReactFlowProvider>
 }

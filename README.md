@@ -70,7 +70,7 @@ In **Add connection > VPS / SSH**, open **Import from SSH config**, choose your 
 
 After selecting a config, choose **Save N host aliases** to store its parsed host settings for future VPS entries. Saved aliases remain in the SSH setup library until deleted. The importer applies matching Host patterns and first-value precedence, including wildcard defaults. It does not execute commands or follow Include paths. Entries requiring ProxyCommand, ProxyJump, Include, or Match are saved with a warning and disabled for selection until configured manually. URL-shaped HostName values are also retained as flagged entries. Other SSH options are not imported.
 
-Open **SSH Files** from the header in either workspace to browse saved config filenames and host aliases alongside saved key filenames and fingerprints. Add and save a separate context note for each config or key. Config files are parsed in the browser; the server stores their filenames and imported host settings, not the raw config text. Private-key contents remain encrypted on the server and are never displayed or returned to the browser.
+Open **SSH Files** from the header in either workspace to browse saved config filenames and host aliases alongside reusable keys and keys attached to a VPS. Add and save a separate context note for each config or key. Config files are parsed in the browser; the server stores their filenames and imported host settings, not the raw config text. Private-key contents remain encrypted on the server and are never displayed or returned to the browser. A VPS-attached key can be removed from its host in the library; Orbit then disables SSH access for that host until a key is added again.
 
 ## OpenSSH key-pair login
 

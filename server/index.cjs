@@ -143,6 +143,16 @@ app.use('/api', (req, res, next) => {
 
 const listSshIdentities = () => database.prepare('SELECT id, name, public_key AS publicKey, key_fingerprint AS keyFingerprint, upload_file_name AS uploadFileName, context, created_at AS createdAt FROM ssh_identities ORDER BY name COLLATE NOCASE').all()
 const listSshProfiles = () => database.prepare('SELECT id, config_name AS configName, alias, host, username, port, identity_files AS identityFilesJson, problems AS problemsJson, upload_file_name AS uploadFileName, context FROM ssh_profiles ORDER BY config_name COLLATE NOCASE, alias COLLATE NOCASE').all().map((profile) => ({ ...profile, identityFiles: JSON.parse(profile.identityFilesJson), problems: JSON.parse(profile.problemsJson), identityFilesJson: undefined, problemsJson: undefined }))
+const listSshFiles = () => {
+  const identities = listSshIdentities().map((identity) => ({ ...identity, source: 'library' }))
+  const identityIds = new Set(identities.map((identity) => identity.id))
+  const attached = database.prepare('SELECT id, payload, encrypted_key AS encryptedKey, created_at AS createdAt FROM nodes WHERE encrypted_key IS NOT NULL ORDER BY created_at').all().flatMap((row) => {
+    const payload = JSON.parse(row.payload)
+    if (payload.type !== 'vps' || (payload.sshIdentityId && identityIds.has(payload.sshIdentityId))) return []
+    return [{ id: row.id, name: payload.name, hostName: payload.name, publicKey: payload.publicKey || '', keyFingerprint: payload.keyFingerprint || '', uploadFileName: payload.sshKeyFileName || '', context: payload.sshKeyContext || '', createdAt: row.createdAt, source: 'vps' }]
+  })
+  return [...identities, ...attached]
+}
 
 app.get('/api/ssh-identities', (_req, res) => res.json({ identities: listSshIdentities() }))
 app.post('/api/ssh-identities', (req, res) => {
@@ -213,6 +223,7 @@ app.patch('/api/ssh-profiles/:configName/context', (req, res) => {
   const result = database.prepare('UPDATE ssh_profiles SET context = ? WHERE config_name = ?').run(req.body.context.trim(), req.params.configName)
   return result.changes ? res.json({ profiles: listSshProfiles().filter((profile) => profile.configName === req.params.configName) }) : res.status(404).json({ error: 'Saved SSH config not found.' })
 })
+app.get('/api/ssh-files', (_req, res) => res.json({ files: listSshFiles() }))
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }))
 app.get('/api/session', (req, res) => res.json({ authenticated: hasValidSession(req) }))
@@ -278,6 +289,8 @@ function toGraphNode(row) {
       notes: payload.notes || '',
       publicKey: payload.publicKey || '',
       keyFingerprint: payload.keyFingerprint || '',
+      sshKeyFileName: payload.sshKeyFileName || '',
+      sshKeyContext: payload.sshKeyContext || '',
       hasPrivateKey: Boolean(row.encrypted_key),
       hostFingerprint: row.host_fingerprint || '',
       connectionStatus: row.connection_status,
@@ -359,16 +372,19 @@ app.post('/api/nodes', (req, res) => {
         if (!identity) return res.status(400).json({ error: 'Choose a saved SSH key that still exists.' })
         payload.publicKey = identity.public_key
         payload.keyFingerprint = identity.key_fingerprint
+        payload.sshIdentityId = identity.id
         encryptedKey = identity.encrypted_key
       } else {
         const key = readPrivateKey(body.privateKey, body.passphrase ?? '')
         payload.publicKey = key.publicKey
         payload.keyFingerprint = key.keyFingerprint
         encryptedKey = seal(JSON.stringify({ privateKey: key.privateKey, passphrase: key.passphrase }))
+        payload.sshKeyFileName = typeof body.sshKeyUploadFileName === 'string' ? body.sshKeyUploadFileName.replace(/[\\/]/g, '/').split('/').pop().trim().slice(0, 180) : ''
+        payload.sshKeyContext = ''
         if (body.rememberSshKey === true) {
           payload.rememberSshKeyName = requireString(body.rememberSshKeyName, 'Saved key name', 80)
           const uploadFileName = typeof body.sshKeyUploadFileName === 'string' ? body.sshKeyUploadFileName.replace(/[\\/]/g, '/').split('/').pop().trim().slice(0, 180) : ''
-          payload.rememberSshIdentity = { publicKey: key.publicKey, keyFingerprint: key.keyFingerprint, encryptedKey, uploadFileName }
+          payload.rememberSshIdentity = { publicKey: key.publicKey, keyFingerprint: key.keyFingerprint, encryptedKey, uploadFileName, id: crypto.randomUUID() }
         }
       }
     } else if (type === 'tunnel' || type === 'external') {
@@ -378,7 +394,8 @@ app.post('/api/nodes', (req, res) => {
     database.transaction(() => {
       if (payload.rememberSshIdentity) {
         const saved = payload.rememberSshIdentity
-        database.prepare('INSERT INTO ssh_identities (id, name, public_key, key_fingerprint, encrypted_key, upload_file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(crypto.randomUUID(), payload.rememberSshKeyName, saved.publicKey, saved.keyFingerprint, saved.encryptedKey, saved.uploadFileName, now)
+        database.prepare('INSERT INTO ssh_identities (id, name, public_key, key_fingerprint, encrypted_key, upload_file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(saved.id, payload.rememberSshKeyName, saved.publicKey, saved.keyFingerprint, saved.encryptedKey, saved.uploadFileName, now)
+        payload.sshIdentityId = saved.id
         delete payload.rememberSshIdentity
         delete payload.rememberSshKeyName
       }
@@ -414,6 +431,27 @@ app.patch('/api/nodes/:id', (req, res) => {
 app.delete('/api/nodes/:id', (req, res) => {
   const result = database.prepare('DELETE FROM nodes WHERE id = ?').run(req.params.id)
   return result.changes ? res.status(204).end() : res.status(404).json({ error: 'Resource not found.' })
+})
+app.patch('/api/nodes/:id/ssh-file-context', (req, res) => {
+  if (typeof req.body?.context !== 'string' || req.body.context.length > 1000) return res.status(400).json({ error: 'File context must be 1000 characters or fewer.' })
+  const row = rowById.get(req.params.id)
+  if (!row || !row.encrypted_key || JSON.parse(row.payload).type !== 'vps') return res.status(404).json({ error: 'VPS SSH key file not found.' })
+  const payload = JSON.parse(row.payload)
+  payload.sshKeyContext = req.body.context.trim()
+  database.prepare('UPDATE nodes SET payload = ? WHERE id = ?').run(JSON.stringify(payload), row.id)
+  return res.json({ id: row.id, context: payload.sshKeyContext })
+})
+app.delete('/api/nodes/:id/ssh-key', (req, res) => {
+  const row = rowById.get(req.params.id)
+  if (!row || !row.encrypted_key || JSON.parse(row.payload).type !== 'vps') return res.status(404).json({ error: 'VPS SSH key file not found.' })
+  const payload = JSON.parse(row.payload)
+  delete payload.sshKeyFileName
+  delete payload.sshKeyContext
+  delete payload.sshIdentityId
+  delete payload.publicKey
+  delete payload.keyFingerprint
+  database.prepare("UPDATE nodes SET payload = ?, encrypted_key = NULL, connection_status = 'untested', last_checked_at = NULL WHERE id = ?").run(JSON.stringify(payload), row.id)
+  return res.status(204).end()
 })
 
 app.post('/api/edges', (req, res) => {
