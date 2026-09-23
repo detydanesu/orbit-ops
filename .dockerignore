@@ -1,0 +1,9 @@
+node_modules
+dist
+data
+.git
+.env
+.env.*
+coverage
+*.log
+*.tsbuildinfo
