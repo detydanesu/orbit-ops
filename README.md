@@ -4,7 +4,7 @@ A self-hosted topology dashboard for VPS hosts, services, and tunnels. It is a s
 
 ## What it does
 
-- Map VPSes, Cloudflare Tunnels, external endpoints, and services on draggable, named graph boards.
+- Map VPSes and services on draggable, named graph boards. Record a tunnel or external endpoint as a service with its provider and endpoint.
 - Switch between Map and Desktop views using the header toggle; both share the same saved resources. Your view preference is remembered in this browser.
 - Open desktop resource windows, move or resize them, and minimize/restore them from the dock. On small screens, windows fit the viewport and forms scroll.
 - Add a VPS by importing or pasting an OpenSSH private key (Ed25519, RSA, or ECDSA), including passphrase-protected keys. Invalid keys are rejected before saving. Check the connection, then open an interactive browser terminal over SSH.
