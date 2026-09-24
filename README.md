@@ -65,6 +65,8 @@ curl -fsSL https://raw.githubusercontent.com/detydanesu/orbit-ops/main/deploy-sy
 
 This installs the `orbit-ops` system service with a dedicated user, listening on `127.0.0.1:8787`. It preserves generated credentials across updates in `/etc/orbit-ops/environment` (root only). Read `ADMIN_PASSWORD` there to sign in. The database lives in `/var/lib/orbit-ops`; back it up together with the environment file. Use an HTTPS reverse proxy or Cloudflare Tunnel for browser access. Rerun the same command to update.
 
+On small VPSes, configure persistent swap before installing. The native installer checks for at least 1.5 GiB of available RAM plus free swap and runs dependency builds at lower priority, so an update does not exhaust memory needed by other services.
+
 ## Import an SSH config
 
 Open **SSH Files** from the header, choose your `.ssh/config` file, review the parsed host aliases, give the file a library name, and save it. The config is parsed in your browser; its original text is not sent to or stored on the server.

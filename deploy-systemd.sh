@@ -6,10 +6,24 @@ umask 022
 [[ "$(id -u)" == 0 ]] || { echo "Run this script as root." >&2; exit 1; }
 repo_slug="${1:-detydanesu/orbit-ops}"
 [[ "$repo_slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || exit 2
-for tool in node npm git openssl systemctl curl; do
+for tool in node npm git openssl systemctl curl awk nice; do
   command -v "$tool" >/dev/null || { echo "Install $tool first." >&2; exit 1; }
 done
 node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
+
+# Native modules can exhaust a small host and disrupt unrelated services.
+if [[ -r /proc/meminfo ]]; then
+  available_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+  swap_free_kib="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)"
+  if [[ -n "$available_kib" && -n "$swap_free_kib" ]] &&
+     (( available_kib + swap_free_kib < 1572864 )); then
+    echo "Native installation needs at least 1.5 GiB of available RAM and swap. Add swap or use a larger host before deploying." >&2
+    exit 1
+  fi
+fi
+
+# Keep native compilation from monopolizing a small VPS during updates.
+export MAKEFLAGS="${MAKEFLAGS:--j1}"
 app_dir=/opt/orbit-ops
 if [[ -d "$app_dir/.git" ]]; then
   [[ -z "$(git -C "$app_dir" status --porcelain)" ]] || { echo "Checkout has local changes; preserve them before updating." >&2; exit 1; }
@@ -38,9 +52,9 @@ EOF
   )
 fi
 cd "$app_dir"
-npm ci
-npm run build
-npm prune --omit=dev
+nice -n 10 npm ci
+nice -n 10 npm run build
+nice -n 10 npm prune --omit=dev
 # Make build outputs readable by the dedicated service user, including on repair.
 chmod -R a+rX "$app_dir/dist" "$app_dir/node_modules"
 node_binary="$(command -v node)"
