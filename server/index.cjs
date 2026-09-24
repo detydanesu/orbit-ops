@@ -148,7 +148,7 @@ const listSshFiles = () => {
   const identityIds = new Set(identities.map((identity) => identity.id))
   const attached = database.prepare('SELECT id, payload, encrypted_key AS encryptedKey, created_at AS createdAt FROM nodes WHERE encrypted_key IS NOT NULL ORDER BY created_at').all().flatMap((row) => {
     const payload = JSON.parse(row.payload)
-    if (payload.type !== 'vps' || (payload.sshIdentityId && identityIds.has(payload.sshIdentityId))) return []
+    if (payload.type !== 'vps' || payload.sshAuthMethod === 'password' || (payload.sshIdentityId && identityIds.has(payload.sshIdentityId))) return []
     return [{ id: row.id, name: payload.name, hostName: payload.name, publicKey: payload.publicKey || '', keyFingerprint: payload.keyFingerprint || '', uploadFileName: payload.sshKeyFileName || '', context: payload.sshKeyContext || '', createdAt: row.createdAt, source: 'vps' }]
   })
   return [...identities, ...attached]
@@ -291,7 +291,9 @@ function toGraphNode(row) {
       keyFingerprint: payload.keyFingerprint || '',
       sshKeyFileName: payload.sshKeyFileName || '',
       sshKeyContext: payload.sshKeyContext || '',
-      hasPrivateKey: Boolean(row.encrypted_key),
+      sshAuthMethod: row.encrypted_key ? payload.sshAuthMethod || 'key' : '',
+      hasSshCredentials: Boolean(row.encrypted_key),
+      hasPrivateKey: Boolean(row.encrypted_key) && (payload.sshAuthMethod || 'key') === 'key',
       hostFingerprint: row.host_fingerprint || '',
       connectionStatus: row.connection_status,
       lastCheckedAt: row.last_checked_at || '',
@@ -367,7 +369,14 @@ app.post('/api/nodes', (req, res) => {
       payload.port = Number(body.port || 22)
       if (!Number.isInteger(payload.port) || payload.port < 1 || payload.port > 65535) return res.status(400).json({ error: 'SSH port must be between 1 and 65535.' })
       payload.username = requireString(body.username, 'SSH user', 80)
-      if (typeof body.sshIdentityId === 'string' && body.sshIdentityId) {
+      const authMethod = body.sshAuthMethod === undefined ? 'key' : body.sshAuthMethod
+      if (authMethod !== 'key' && authMethod !== 'password') return res.status(400).json({ error: 'Choose password or a saved SSH key.' })
+      payload.sshAuthMethod = authMethod
+      if (authMethod === 'password') {
+        const password = body.sshPassword
+        if (typeof password !== 'string' || password.length === 0 || Buffer.byteLength(password, 'utf8') > 4096) return res.status(400).json({ error: 'Enter an SSH password of 1 to 4096 bytes.' })
+        encryptedKey = seal(JSON.stringify({ method: 'password', password }))
+      } else if (typeof body.sshIdentityId === 'string' && body.sshIdentityId) {
         const identity = database.prepare('SELECT * FROM ssh_identities WHERE id = ?').get(body.sshIdentityId)
         if (!identity) return res.status(400).json({ error: 'Choose a saved SSH key that still exists.' })
         payload.publicKey = identity.public_key
@@ -375,30 +384,13 @@ app.post('/api/nodes', (req, res) => {
         payload.sshIdentityId = identity.id
         encryptedKey = identity.encrypted_key
       } else {
-        const key = readPrivateKey(body.privateKey, body.passphrase ?? '')
-        payload.publicKey = key.publicKey
-        payload.keyFingerprint = key.keyFingerprint
-        encryptedKey = seal(JSON.stringify({ privateKey: key.privateKey, passphrase: key.passphrase }))
-        payload.sshKeyFileName = typeof body.sshKeyUploadFileName === 'string' ? body.sshKeyUploadFileName.replace(/[\\/]/g, '/').split('/').pop().trim().slice(0, 180) : ''
-        payload.sshKeyContext = ''
-        if (body.rememberSshKey === true) {
-          payload.rememberSshKeyName = requireString(body.rememberSshKeyName, 'Saved key name', 80)
-          const uploadFileName = typeof body.sshKeyUploadFileName === 'string' ? body.sshKeyUploadFileName.replace(/[\\/]/g, '/').split('/').pop().trim().slice(0, 180) : ''
-          payload.rememberSshIdentity = { publicKey: key.publicKey, keyFingerprint: key.keyFingerprint, encryptedKey, uploadFileName, id: crypto.randomUUID() }
-        }
+        return res.status(400).json({ error: 'Upload the private key in SSH Files, then select it here.' })
       }
     } else if (type === 'tunnel' || type === 'external') {
       if (!payload.endpoint && !payload.provider) return res.status(400).json({ error: 'Add an endpoint or provider for this resource.' })
     }
     const now = new Date().toISOString()
     database.transaction(() => {
-      if (payload.rememberSshIdentity) {
-        const saved = payload.rememberSshIdentity
-        database.prepare('INSERT INTO ssh_identities (id, name, public_key, key_fingerprint, encrypted_key, upload_file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(saved.id, payload.rememberSshKeyName, saved.publicKey, saved.keyFingerprint, saved.encryptedKey, saved.uploadFileName, now)
-        payload.sshIdentityId = saved.id
-        delete payload.rememberSshIdentity
-        delete payload.rememberSshKeyName
-      }
       database.prepare('INSERT INTO nodes (id, payload, encrypted_key, x, y, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, JSON.stringify(payload), encryptedKey, x, y, now)
       database.prepare('INSERT INTO board_nodes (node_id, board_id) VALUES (?, ?)').run(id, boardId)
       if (body.parentId && body.parentId !== id) {
@@ -477,7 +469,7 @@ app.delete('/api/nodes/:id', (req, res) => {
 app.patch('/api/nodes/:id/ssh-file-context', (req, res) => {
   if (typeof req.body?.context !== 'string' || req.body.context.length > 1000) return res.status(400).json({ error: 'File context must be 1000 characters or fewer.' })
   const row = rowById.get(req.params.id)
-  if (!row || !row.encrypted_key || JSON.parse(row.payload).type !== 'vps') return res.status(404).json({ error: 'VPS SSH key file not found.' })
+  if (!row || !row.encrypted_key || JSON.parse(row.payload).type !== 'vps' || JSON.parse(row.payload).sshAuthMethod === 'password') return res.status(404).json({ error: 'VPS SSH key file not found.' })
   const payload = JSON.parse(row.payload)
   payload.sshKeyContext = req.body.context.trim()
   database.prepare('UPDATE nodes SET payload = ? WHERE id = ?').run(JSON.stringify(payload), row.id)
@@ -485,7 +477,7 @@ app.patch('/api/nodes/:id/ssh-file-context', (req, res) => {
 })
 app.delete('/api/nodes/:id/ssh-key', (req, res) => {
   const row = rowById.get(req.params.id)
-  if (!row || !row.encrypted_key || JSON.parse(row.payload).type !== 'vps') return res.status(404).json({ error: 'VPS SSH key file not found.' })
+  if (!row || !row.encrypted_key || JSON.parse(row.payload).type !== 'vps' || JSON.parse(row.payload).sshAuthMethod === 'password') return res.status(404).json({ error: 'VPS SSH key file not found.' })
   const payload = JSON.parse(row.payload)
   delete payload.sshKeyFileName
   delete payload.sshKeyContext
@@ -520,8 +512,13 @@ function sshFingerprint(hostKey) {
   return `SHA256:${hash}`
 }
 
+function sshAuthenticationOptions(auth) {
+  if (auth.method === 'password') return { password: auth.password }
+  return { privateKey: auth.privateKey, passphrase: auth.passphrase || undefined }
+}
+
 function checkSsh(row) {
-  if (!row.encrypted_key) return Promise.reject(new Error('This host has no SSH key stored.'))
+  if (!row.encrypted_key) return Promise.reject(new Error('This host has no SSH credentials stored.'))
   const payload = JSON.parse(row.payload)
   const auth = JSON.parse(unseal(row.encrypted_key))
   return new Promise((resolve) => {
@@ -545,8 +542,7 @@ function checkSsh(row) {
       host: payload.host,
       port: payload.port,
       username: payload.username,
-      privateKey: auth.privateKey,
-      passphrase: auth.passphrase || undefined,
+      ...sshAuthenticationOptions(auth),
       readyTimeout: 11_000,
       hostVerifier: (hostKey) => {
         fingerprint = sshFingerprint(hostKey)
@@ -688,13 +684,12 @@ terminalSockets.on('connection', (websocket, _req, row) => {
       host: payload.host,
       port: payload.port,
       username: payload.username,
-      privateKey: auth.privateKey,
-      passphrase: auth.passphrase || undefined,
+      ...sshAuthenticationOptions(auth),
       readyTimeout: 18_000,
       hostVerifier: (hostKey) => safeEqual(sshFingerprint(hostKey), row.host_fingerprint),
     })
   } catch {
-    send({ type: 'error', message: 'The saved SSH key could not be loaded. Check the key format and passphrase.' })
+    send({ type: 'error', message: 'The saved SSH credentials could not be used. Check the password or private key.' })
     websocket.close(1011, 'Invalid SSH credentials')
     closeConnection()
   }

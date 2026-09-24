@@ -15,6 +15,7 @@ test('terminal pins SSH keys, relays input, ignores malformed input, and contain
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-terminal-'))
   const key = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs1', format: 'pem' })
   const loginKey = utils.generateKeyPairSync('ed25519', { passphrase: 'fixture-passphrase', cipher: 'aes256-ctr' })
+  const fixturePassword = 'fixture ssh password with spaces'
   const authorizedKey = utils.parseKey(loginKey.public)
   const clients = new Set()
   const ssh = new Server({ hostKeys: [key] }, (client) => {
@@ -22,6 +23,9 @@ test('terminal pins SSH keys, relays input, ignores malformed input, and contain
     client.on('error', () => {})
     client.on('close', () => clients.delete(client))
     client.on('authentication', (context) => {
+      if (context.method === 'password') {
+        return context.username === 'fixture-password' && context.password === fixturePassword ? context.accept() : context.reject()
+      }
       if (context.method !== 'publickey' || context.username !== 'fixture' || !context.key.data.equals(authorizedKey.getPublicSSH())) return context.reject()
       if (context.signature && authorizedKey.verify(context.blob, context.signature, context.hashAlgo) !== true) return context.reject()
       context.accept()
@@ -59,7 +63,8 @@ test('terminal pins SSH keys, relays input, ignores malformed input, and contain
     })
     const login = await fetch(base + '/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'terminal-fixture' }) })
     cookie = login.headers.get('set-cookie').split(';')[0]
-    const { node } = await api('/nodes', { type: 'vps', name: 'Local SSH fixture', host: '127.0.0.1', port: ssh.address().port, username: 'fixture', privateKey: loginKey.private, passphrase: 'fixture-passphrase' })
+    const { identity } = await api('/ssh-identities', { name: 'Fixture login key', privateKey: loginKey.private, passphrase: 'fixture-passphrase' })
+    const { node } = await api('/nodes', { type: 'vps', name: 'Local SSH fixture', host: '127.0.0.1', port: ssh.address().port, username: 'fixture', sshAuthMethod: 'key', sshIdentityId: identity.id })
     const check = await api(`/nodes/${node.id}/test-ssh`, {})
     assert.equal(check.needsTrust, true)
     await api(`/nodes/${node.id}/trust-host-key`, { fingerprint: check.fingerprint })
@@ -81,7 +86,31 @@ test('terminal pins SSH keys, relays input, ignores malformed input, and contain
     await waitFor(() => output.some((item) => item.data?.includes('echo:hello')))
     socket.close()
     await once(socket, 'close')
-    const { node: bad } = await api('/nodes', { type: 'vps', name: 'Bad key fixture', host: '127.0.0.1', port: ssh.address().port, username: 'fixture', privateKey: key })
+    const { node: passwordNode } = await api('/nodes', { type: 'vps', name: 'Password SSH fixture', host: '127.0.0.1', port: ssh.address().port, username: 'fixture-password', sshAuthMethod: 'password', sshPassword: fixturePassword })
+    assert.equal(passwordNode.data.sshAuthMethod, 'password')
+    assert.equal(passwordNode.data.hasSshCredentials, true)
+    assert.equal(passwordNode.data.hasPrivateKey, false)
+    const passwordFiles = await api('/ssh-files')
+    assert.equal(passwordFiles.files.some((file) => file.id === passwordNode.id), false)
+    const passwordCheck = await api(`/nodes/${passwordNode.id}/test-ssh`, {})
+    assert.equal(passwordCheck.needsTrust, true)
+    await api(`/nodes/${passwordNode.id}/trust-host-key`, { fingerprint: passwordCheck.fingerprint })
+    assert.equal((await api(`/nodes/${passwordNode.id}/test-ssh`, {})).ok, true)
+    socket = new WebSocket(`ws://127.0.0.1:${port}/api/terminal?nodeId=${passwordNode.id}`, { origin: base, headers: { Cookie: cookie } })
+    const passwordOutput = []
+    socket.on('message', (raw) => passwordOutput.push(JSON.parse(String(raw))))
+    await once(socket, 'open')
+    const passwordWaitFor = async (predicate) => {
+      const end = Date.now() + 5000
+      while (!predicate()) { if (Date.now() > end) throw new Error('Password terminal output timed out'); await new Promise((resolve) => setTimeout(resolve, 20)) }
+    }
+    await passwordWaitFor(() => passwordOutput.some((item) => item.type === 'ready'))
+    socket.send(JSON.stringify({ type: 'input', data: 'password-ok\r\n' }))
+    await passwordWaitFor(() => passwordOutput.some((item) => item.data?.includes('echo:password-ok')))
+    socket.close()
+    await once(socket, 'close')
+    const { identity: badIdentity } = await api('/ssh-identities', { name: 'Invalid fixture key', privateKey: key })
+    const { node: bad } = await api('/nodes', { type: 'vps', name: 'Bad key fixture', host: '127.0.0.1', port: ssh.address().port, username: 'fixture', sshAuthMethod: 'key', sshIdentityId: badIdentity.id })
     const db = new Database(path.join(fixture, 'orbit-ops.sqlite'))
     db.prepare('UPDATE nodes SET host_fingerprint = ? WHERE id = ?').run(check.fingerprint, bad.id)
     db.close()

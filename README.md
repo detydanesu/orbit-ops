@@ -7,13 +7,13 @@ A self-hosted topology dashboard for VPS hosts, services, and tunnels. It is a s
 - Map VPSes and services on draggable, named graph boards. Record a tunnel or external endpoint as a service with its provider and endpoint.
 - Switch between Map and Desktop views using the header toggle; both share the same saved resources. Your view preference is remembered in this browser.
 - Open desktop resource windows, move or resize them, and minimize/restore them from the dock. On small screens, windows fit the viewport and forms scroll.
-- Upload SSH config and private-key files only in **SSH Files**, then select saved aliases and keys when adding a VPS. Private keys are encrypted on the server; verify the SSH host fingerprint before opening a terminal.
+- Upload SSH config and private-key files only in **SSH Files**, then select saved aliases and keys when adding a VPS. You can also enter an SSH account password. Keys and passwords are encrypted on the server; verify the SSH host fingerprint before opening a terminal.
 - Edit saved VPS and service details from their resource windows. Changing a VPS host or port clears its host-key trust for re-verification.
 - Pin the SSH host fingerprint on first use; a changed key must be checked against the provider console before it can be trusted.
-- Store graph data in SQLite and encrypt SSH private keys and key passphrases with AES-256-GCM.
+- Store graph data in SQLite and encrypt SSH private keys, key passphrases, and account passwords with AES-256-GCM.
 - Keep Cloudflare and other service entries as topology inventory. They are not continuously monitored and do not call provider APIs.
 
-The dashboard host must be able to make outbound SSH connections to each VPS. The browser never opens an SSH socket and never receives a saved private key back from the server. The terminal relays an interactive SSH shell through an authenticated, same-origin WebSocket; it is enabled only after you verify and pin the host fingerprint.
+The dashboard host must be able to make outbound SSH connections to each VPS. The browser never opens an SSH socket and never receives saved SSH credentials back from the server. The terminal relays an interactive SSH shell through an authenticated, same-origin WebSocket; it is enabled only after you verify and pin the host fingerprint.
 
 ## Workspace views and graph boards
 
@@ -75,13 +75,11 @@ In **Add connection > VPS / SSH**, choose a saved host alias to fill in the host
 
 SSH Files lists saved config names, host aliases, reusable keys, and keys attached to a VPS. Add and save a context note for each config or key. A VPS-attached key can be removed from its host in the library; Orbit then disables SSH access for that host until a key is added again.
 
-## OpenSSH key-pair login
+## SSH login methods
 
-1. Install your public key in `~/.ssh/authorized_keys` for the VPS account.
-2. Open **SSH Files**, upload the OpenSSH private-key file (`id_ed25519`, `id_rsa`, or PEM), and enter its passphrase if it is encrypted. A `.pub` file alone cannot authenticate.
-3. Give the key a library name and save it. The private key and passphrase are encrypted at rest and never returned by the API.
-4. In **Add connection > VPS / SSH**, select a saved host alias if desired, then choose the private key from SSH Files. Direct upload or paste is not available in this form.
-5. Check SSH, verify the separate server host-key fingerprint against a trusted source, then open the terminal.
+In **Add connection > VPS / SSH**, choose either **SSH key** or **Password**. For key login, install its matching public key in `~/.ssh/authorized_keys`, upload the OpenSSH private-key file (`id_ed25519`, `id_rsa`, or PEM) in **SSH Files**, then select the saved key here. A `.pub` file alone cannot authenticate. Enter the VPS account password directly in the Password option when password authentication is enabled on that host.
+
+Private keys, key passphrases, and account passwords are encrypted at rest and never returned by the API. Files can be uploaded only through SSH Files. Check SSH, verify the separate server host-key fingerprint against a trusted source, then open the terminal.
 
 This uses direct SSH from the Orbit server. Cloudflare Access SSH hostnames require a separately configured transport.
 
@@ -100,9 +98,9 @@ docker compose up -d --build
 ## Data and security boundaries
 
 - One local administrator password controls the dashboard; there are no user accounts or remote identity integrations.
-- SSH keys are encrypted at rest using the `DATA_ENCRYPTION_KEY`. SSH host fingerprints are pinned before authentication; verify the first fingerprint through your VPS provider's console.
-- Interactive terminals use the saved key on the server and open a PTY only; the private key is not exposed to the browser. Keep dashboard access protected and close the terminal window to end its SSH session.
-- Deleting a host removes its encrypted key and graph links from the database.
+- SSH keys and account passwords are encrypted at rest using the `DATA_ENCRYPTION_KEY`. SSH host fingerprints are pinned before authentication; verify the first fingerprint through your VPS provider's console.
+- Interactive terminals use the saved SSH credentials on the server and open a PTY only; credentials are not exposed to the browser. Keep dashboard access protected and close the terminal window to end its SSH session.
+- Deleting a host removes its encrypted credentials and graph links from the database.
 - Service and tunnel nodes are user-maintained inventory, not live status checks.
 - The published host port binds to loopback. Expose it through an HTTPS reverse proxy or Cloudflare Tunnel, not a public plain-HTTP port.
 
